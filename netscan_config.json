@@ -1,0 +1,41 @@
+{
+  "config": {
+    "scanning": {
+      "default_port": 22,
+      "default_timeout": 10,
+      "default_threads": 20,
+      "use_nmap": true,
+      "max_retries": 3
+    },
+    "ssh": {
+      "auth_timeout": 10,
+      "key_discovery": true,
+      "preferred_auth": "key",
+      "connection_pool_size": 20
+    },
+    "database": {
+      "path": "netscan.db",
+      "backup_enabled": true,
+      "backup_interval": 7,
+      "vacuum_enabled": true
+    },
+    "reporting": {
+      "default_format": "table",
+      "max_results": 1000,
+      "export_timestamp": true,
+      "include_metadata": true
+    },
+    "logging": {
+      "level": "DEBUG",
+      "file_enabled": false,
+      "file_path": "netscan.log",
+      "max_size": 10485760,
+      "backup_count": 5
+    }
+  },
+  "metadata": {
+    "export_time": "2025-07-09T17:54:56.618549",
+    "version": "0.1.0",
+    "source": "netscan"
+  }
+}
