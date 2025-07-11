@@ -74,6 +74,7 @@ class NetScanLogger:
     def configure_from_config_manager(self):
         """Configure logger from config manager settings"""
         try:
+            # Import inside try block to handle circular imports gracefully
             from ..config import config_manager
             
             logging_config = config_manager.get_section('logging')
@@ -85,15 +86,21 @@ class NetScanLogger:
                 max_size=logging_config.get('max_size', 10485760),
                 backup_count=logging_config.get('backup_count', 5)
             )
-        except Exception as e:
-            # Fallback to default configuration
+        except ImportError:
+            # Config manager not available yet (circular import), use defaults
             self.configure()
-            self.logger.warning(f"Could not load logging configuration: {e}")
+        except Exception as e:
+            # Other errors, use defaults and warn
+            self.configure()
+            if hasattr(self, 'logger') and self.logger:
+                self.logger.debug(f"Could not load logging configuration: {e}")
     
     def get_logger(self) -> logging.Logger:
         """Get the configured logger instance"""
         if not self._configured:
-            self.configure_from_config_manager()
+            # Use default configuration instead of trying to load from config manager
+            # This avoids circular imports during module initialization
+            self.configure()
         return self.logger
 
 
@@ -126,6 +133,7 @@ def get_logger(name: Optional[str] = None) -> logging.Logger:
 def setup_logging():
     """Setup logging for the entire application"""
     try:
+        # Import inside try block to handle circular imports gracefully
         from ..config import config_manager
         
         logging_config = config_manager.get_section('logging')
@@ -141,10 +149,13 @@ def setup_logging():
                 backup_count=logging_config.get('backup_count', 5)
             )
     
-    except Exception as e:
-        # Fallback configuration
+    except ImportError:
+        # Config manager not available yet (circular import), use defaults
         _main_logger.configure()
-        _main_logger.get_logger().warning(f"Could not setup logging from config: {e}")
+    except Exception as e:
+        # Other errors, use defaults and warn
+        _main_logger.configure()
+        _main_logger.get_logger().debug(f"Could not setup logging from config: {e}")
 
 
 def log_function_call(func):

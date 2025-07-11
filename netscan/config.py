@@ -12,7 +12,6 @@ from pathlib import Path
 from datetime import datetime
 import getpass
 
-from .database.operations import db_manager
 from .utils.logging import get_logger
 
 logger = get_logger()
@@ -139,6 +138,7 @@ class ConfigManager:
     def _load_from_database(self):
         """Load configuration from database"""
         try:
+            from .database.operations import db_manager
             db_config = db_manager.get_all_config()
             
             for key, value in db_config.items():
@@ -199,6 +199,7 @@ class ConfigManager:
         # Save to database
         if save_to_db:
             try:
+                from .database.operations import db_manager
                 db_manager.set_config(f"{section}.{key}", str(value))
                 logger.debug(f"Configuration {section}.{key} saved to database")
             except Exception as e:
@@ -402,6 +403,7 @@ class ConfigManager:
         
         # Clear database configuration
         try:
+            from .database.operations import db_manager
             db_config = db_manager.get_all_config()
             for key in db_config.keys():
                 if '.' in key:  # Only delete netscan config keys

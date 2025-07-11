@@ -63,7 +63,7 @@ venv\Scripts\activate     # Windows
 pip install -r requirements.txt
 
 # Verify installation
-python -m netscan --help
+python -m netscan --helppytho
 ```
 
 ## Quick Start
@@ -71,13 +71,13 @@ python -m netscan --help
 ### 1. First Scan
 ```bash
 # Basic network scan
-python -m netscan scan --range 192.168.1.0/24 --username admin
+python -m netscan scan network --range 192.168.1.0/24 --username admin
 
-# Scan with password (will prompt securely)
-python -m netscan scan --range 10.0.0.0/16 --username root --prompt-password
+# Scan with password (will prompt securely) 
+python -m netscan scan network --range 10.0.0.0/16 --username root --password
 
 # Scan specific hosts
-python -m netscan scan --range 192.168.1.10,192.168.1.20,192.168.1.30 --username admin
+python -m netscan scan network --range 192.168.1.10,192.168.1.20,192.168.1.30 --username admin
 ```
 
 ### 2. View Results
@@ -101,6 +101,44 @@ python -m netscan config set-credential password
 # Configure scanning settings
 python -m netscan config set scanning.threads 20
 python -m netscan config set scanning.timeout 10
+```
+
+## CLI Command Structure
+
+NetScan uses a hierarchical command structure with subcommands:
+
+### Main Command Groups
+- **scan** - Network scanning operations
+  - `scan network` - Discover hosts with SSH capability
+  - `scan auth` - Test SSH authentication on hosts
+  - `scan info` - Collect detailed system information
+- **report** - Generate and export reports
+  - `report hosts` - List discovered hosts
+  - `report summary` - Generate summary statistics
+  - `report export` - Export data to files
+  - `report history` - View scan history
+- **config** - Configuration management
+  - `config set` - Set configuration values
+  - `config show` - Display current configuration
+  - `config credentials` - Manage stored credentials
+- **database** - Database operations
+  - `database init` - Initialize database
+  - `database backup` - Create database backup
+  - `database restore` - Restore from backup
+
+### Getting Help
+```bash
+# General help
+python -m netscan --help
+
+# Help for specific command groups
+python -m netscan scan --help
+python -m netscan report --help
+python -m netscan config --help
+
+# Help for specific commands
+python -m netscan scan network --help
+python -m netscan report hosts --help
 ```
 
 ## Configuration
@@ -196,19 +234,19 @@ python -m netscan config delete-credential password
 ### Basic Scanning
 ```bash
 # Scan IP range with username/password
-python -m netscan scan --range 192.168.1.0/24 --username admin --password secret
+python -m netscan scan network --range 192.168.1.0/24 --username admin --password secret
 
-# Scan with SSH key authentication
-python -m netscan scan --range 10.0.0.0/8 --username admin --key-file ~/.ssh/id_rsa
+# Scan with SSH key authentication  
+python -m netscan scan auth --hosts $(python -m netscan scan network --range 10.0.0.0/8 --username admin | grep active) --username admin --key-file ~/.ssh/id_rsa
 
 # Scan specific IPs
-python -m netscan scan --range 192.168.1.10,192.168.1.20 --username root
+python -m netscan scan network --range 192.168.1.10,192.168.1.20 --username root
 ```
 
 ### Advanced Scanning Options
 ```bash
 # Customize scanning parameters
-python -m netscan scan \
+python -m netscan scan network \
     --range 172.16.0.0/12 \
     --username admin \
     --port 2222 \
@@ -216,12 +254,20 @@ python -m netscan scan \
     --threads 50 \
     --no-nmap
 
-# Scan with connection limits
-python -m netscan scan \
-    --range 192.168.0.0/16 \
+# Test SSH authentication on discovered hosts
+python -m netscan scan auth \
+    --from-db \
     --username admin \
-    --max-connections 25 \
-    --connection-timeout 30
+    --password \
+    --timeout 30 \
+    --threads 25
+
+# Collect system information from authenticated hosts
+python -m netscan scan info \
+    --from-db \
+    --username admin \
+    --password \
+    --store-db
 ```
 
 ### Scan Output
@@ -374,7 +420,7 @@ cat > daily-scan.sh << 'EOF'
 #!/bin/bash
 cd /path/to/netscan
 source venv/bin/activate
-python -m netscan scan --range 192.168.1.0/24 --username admin
+python -m netscan scan network --range 192.168.1.0/24 --username admin
 python -m netscan report export --format json --output /var/log/netscan/daily-$(date +%Y%m%d).json
 EOF
 
@@ -424,10 +470,10 @@ python -m netscan report statistics --group-by status
 ```bash
 # Issue: Cannot bind to privileged ports
 # Solution: Use sudo for nmap operations or higher port numbers
-sudo python -m netscan scan --range 192.168.1.0/24 --username admin
+sudo python -m netscan scan network --range 192.168.1.0/24 --username admin
 
 # Or disable nmap
-python -m netscan scan --range 192.168.1.0/24 --username admin --no-nmap
+python -m netscan scan network --range 192.168.1.0/24 --username admin --no-nmap
 ```
 
 #### 2. SSH Connection Failures
@@ -439,7 +485,7 @@ python -m netscan config set-credential password
 
 # For SSH keys
 chmod 600 ~/.ssh/id_rsa
-python -m netscan scan --range 192.168.1.0/24 --username admin --key-file ~/.ssh/id_rsa
+python -m netscan scan auth --from-db --username admin --key-file ~/.ssh/id_rsa
 ```
 
 #### 3. Slow Scanning Performance
@@ -450,7 +496,7 @@ python -m netscan config set scanning.threads 50
 python -m netscan config set scanning.timeout 3
 
 # Or use command line options
-python -m netscan scan --range 192.168.1.0/24 --threads 50 --timeout 3
+python -m netscan scan network --range 192.168.1.0/24 --threads 50 --timeout 3
 ```
 
 #### 4. Database Issues
@@ -469,11 +515,11 @@ python -m netscan database init
 ### Debug Mode
 ```bash
 # Enable verbose logging
-python -m netscan --debug scan --range 192.168.1.0/24 --username admin
+python -m netscan --debug scan network --range 192.168.1.0/24 --username admin
 
 # Or set logging level
 export NETSCAN_LOG_LEVEL=DEBUG
-python -m netscan scan --range 192.168.1.0/24 --username admin
+python -m netscan scan network --range 192.168.1.0/24 --username admin
 ```
 
 ### Log Files
@@ -491,7 +537,7 @@ tail -f /var/log/netscan.log
 ### Example 1: Basic Network Discovery
 ```bash
 # Discover hosts in local network
-python -m netscan scan --range 192.168.1.0/24 --username admin --prompt-password
+python -m netscan scan network --range 192.168.1.0/24 --username admin --password
 
 # View discovered hosts
 python -m netscan report hosts --status active
@@ -512,7 +558,7 @@ python -m netscan config set-credential username enterprise-admin
 python -m netscan config set-credential password
 
 # Scan multiple subnets
-python -m netscan scan --range "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+python -m netscan scan network --range "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
 
 # Generate comprehensive report
 python -m netscan report summary --detailed > enterprise-report.txt
@@ -528,7 +574,7 @@ cd /opt/netscan
 source venv/bin/activate
 
 # Scan network
-python -m netscan scan --range 192.168.1.0/24 --username monitor
+python -m netscan scan network --range 192.168.1.0/24 --username monitor
 
 # Check for new hosts
 NEW_HOSTS=$(python -m netscan report hosts --since "1 hour ago" --format json | jq '.hosts | length')
@@ -569,7 +615,7 @@ jq -r '.hosts[] | "Host \(.hostname)\n  HostName \(.ip_address)\n  User admin\n"
 ### Example 5: Performance Monitoring
 ```bash
 # Set up regular scanning with performance tracking
-python -m netscan scan --range 192.168.1.0/24 --username admin --collect-performance
+python -m netscan scan network --range 192.168.1.0/24 --username admin
 
 # Generate performance report
 python -m netscan report performance --time-range "last 30 days"
@@ -606,5 +652,38 @@ python -m netscan report statistics --group-by performance --output dashboard.js
    - Configure alerts for new/missing hosts
    - Integrate with existing monitoring systems
    - Track performance and capacity trends
+
+## Quick Reference
+
+### Common Commands
+```bash
+# Discover hosts in network
+python -m netscan scan network --range 192.168.1.0/24 --username admin
+
+# Test SSH authentication
+python -m netscan scan auth --from-db --username admin --password
+
+# Collect system information
+python -m netscan scan info --from-db --username admin --store-db
+
+# List active hosts
+python -m netscan report hosts --status active
+
+# Export to JSON
+python -m netscan report export --format json --output hosts.json
+
+# View configuration
+python -m netscan config show
+
+# Set default credentials
+python -m netscan config credentials --interactive
+```
+
+### Command Patterns
+- Network discovery: `scan network --range <IP_RANGE> --username <USER>`
+- Authentication test: `scan auth --from-db --username <USER> [--password|--key-file]`
+- Info collection: `scan info --from-db --username <USER> --store-db`
+- Report generation: `report <TYPE> [--format FORMAT] [--output FILE]`
+- Configuration: `config <OPERATION> [OPTIONS]`
 
 For more information, see the [Development Plan](DEVELOPMENT_PLAN.md) and project documentation. 

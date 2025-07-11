@@ -31,7 +31,7 @@ class SSHConnector:
     def create_ssh_client(self) -> paramiko.SSHClient:
         """Create and configure SSH client"""
         client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddHostKey())
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         return client
     
     def test_connection(self, host: str, port: int = 22, username: str = None, 
@@ -80,11 +80,11 @@ class SSHConnector:
             except Exception as e:
                 logger.debug(f"Could not get server info for {host}: {e}")
             
-            logger.log_ssh_connection(host, username, True)
+            logger.info(f"SSH connection successful: {username}@{host}:{port}")
             
         except paramiko.AuthenticationException as e:
             result['error'] = f"Authentication failed: {str(e)}"
-            logger.log_ssh_connection(host, username, False)
+            logger.warning(f"SSH authentication failed: {username}@{host}:{port}")
         except paramiko.SSHException as e:
             result['error'] = f"SSH error: {str(e)}"
         except socket.timeout:
@@ -93,7 +93,7 @@ class SSHConnector:
             result['error'] = f"Network error: {str(e)}"
         except Exception as e:
             result['error'] = f"Unexpected error: {str(e)}"
-            logger.log_error_with_context(e, f"SSH connection to {host}")
+            logger.error(f"SSH connection to {host}: {str(e)}")
         
         finally:
             if client:
@@ -158,7 +158,7 @@ class SSHConnector:
             result['error'] = "Command execution timeout"
         except Exception as e:
             result['error'] = f"Unexpected error: {str(e)}"
-            logger.log_error_with_context(e, f"Command execution on {host}")
+            logger.error(f"Command execution on {host}: {str(e)}")
         
         finally:
             if client:

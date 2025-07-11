@@ -11,7 +11,7 @@ from rich.panel import Panel
 import os
 import sys
 from datetime import datetime
-from .database.operations import db_manager
+
 from .scanner.network import NetworkScanner
 from .scanner.ssh import SSHConnector
 from .scanner.collector import SystemInfoCollector
@@ -128,6 +128,8 @@ def network(ctx, range, username, password, port, threads, timeout, no_nmap):
         if active_hosts:
             console.print(f"\n[blue]Storing {len(active_hosts)} active hosts in database...[/blue]")
             
+            from .database.operations import db_manager
+            
             for host_result in active_hosts:
                 # Prepare host data for database
                 host_data = {
@@ -199,6 +201,7 @@ def auth(ctx, hosts, from_db, username, password, key_file, port, timeout, threa
     if from_db:
         console.print("[blue]Loading hosts from database...[/blue]")
         try:
+            from .database.operations import db_manager
             hosts_from_db = db_manager.get_all_hosts(status='active')
             host_list = [host.ip_address for host in hosts_from_db]
             console.print(f"[green]Found {len(host_list)} active hosts in database[/green]")
@@ -334,6 +337,7 @@ def info(ctx, hosts, from_db, username, password, key_file, port, timeout, store
     if from_db:
         console.print("[blue]Loading hosts from database...[/blue]")
         try:
+            from .database.operations import db_manager
             hosts_from_db = db_manager.get_all_hosts(status='active')
             host_list = [host.ip_address for host in hosts_from_db]
             console.print(f"[green]Found {len(host_list)} active hosts in database[/green]")
@@ -439,6 +443,7 @@ def info(ctx, hosts, from_db, username, password, key_file, port, timeout, store
                         host_data['disk_usage'] = json.dumps(parsed['disk'])
                     
                     # Create or update host in database
+                    from .database.operations import db_manager
                     db_manager.create_host(host_data)
                     
                 except Exception as e:
@@ -513,6 +518,7 @@ def hosts(ctx, filter, format, output, sort, limit):
     
     try:
         # Get hosts from database
+        from .database.operations import db_manager
         hosts = db_manager.get_all_hosts()
         
         if not hosts:
@@ -591,6 +597,7 @@ def summary(ctx, output):
     
     try:
         # Get hosts and statistics
+        from .database.operations import db_manager
         hosts = db_manager.get_all_hosts()
         stats = db_manager.get_host_statistics()
         
@@ -647,6 +654,7 @@ def export(ctx, format, output, filter, include_history):
     
     try:
         # Get hosts from database
+        from .database.operations import db_manager
         hosts = db_manager.get_all_hosts()
         
         if not hosts:
@@ -724,6 +732,7 @@ def history(ctx, host_id, scan_type, limit, format, output):
     
     try:
         # Get scan history from database
+        from .database.operations import db_manager
         history = db_manager.get_scan_history(host_id=host_id, scan_type=scan_type, limit=limit)
         
         if not history:
@@ -1200,6 +1209,7 @@ def init(ctx):
     
     try:
         # Initialize database
+        from .database.operations import db_manager
         db_manager.init_database()
         console.print("[green]✓ Database initialized successfully[/green]")
         console.print(f"[green]Database path:[/green] {db_manager.database_path}")
