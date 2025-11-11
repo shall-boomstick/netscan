@@ -36,6 +36,7 @@ class ReportFormatter:
         table.add_column("SSH Port", justify="right", style="yellow")
         table.add_column("Status", style="bold")
         table.add_column("OS Info", style="blue")
+        table.add_column("CPU Info", style="yellow")
         table.add_column("Uptime", style="magenta")
         table.add_column("Memory", justify="right", style="cyan")
         table.add_column("Last Scan", style="dim")
@@ -61,12 +62,19 @@ class ReportFormatter:
             if host.last_scan:
                 last_scan_str = host.last_scan.strftime("%Y-%m-%d %H:%M")
             
+            # CPU info formatting
+            cpu_str = "Unknown"
+            if host.cpu_info:
+                # Truncate long CPU model names for display
+                cpu_str = host.cpu_info[:30] + "..." if len(host.cpu_info) > 30 else host.cpu_info
+            
             table.add_row(
                 host.ip_address,
                 host.hostname or "Unknown",
                 str(host.ssh_port),
                 status,
                 host.os_info or "Unknown",
+                cpu_str,
                 host.uptime or "Unknown",
                 memory_str,
                 last_scan_str

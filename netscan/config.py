@@ -28,13 +28,13 @@ class ConfigManager:
         self.defaults = {
             'scanning': {
                 'default_port': 22,
-                'default_timeout': 5,
+                'default_timeout': 3,
                 'default_threads': 10,
                 'use_nmap': True,
                 'max_retries': 3
             },
             'ssh': {
-                'auth_timeout': 10,
+                'auth_timeout': 5,
                 'key_discovery': True,
                 'preferred_auth': 'key',  # 'key', 'password', 'agent'
                 'connection_pool_size': 20

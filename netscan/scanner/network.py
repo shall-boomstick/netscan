@@ -27,7 +27,7 @@ console = Console()
 class NetworkScanner:
     """Network scanner class for discovering SSH-enabled hosts"""
     
-    def __init__(self, timeout: int = 5, threads: int = 10):
+    def __init__(self, timeout: int = 3, threads: int = 10):
         self.timeout = timeout
         self.threads = threads
         self.nm = nmap.PortScanner()
@@ -143,8 +143,10 @@ class NetworkScanner:
         try:
             console.print(f"[yellow]Running nmap scan on {ip_range}...[/yellow]")
             
-            # Perform nmap scan
-            scan_result = self.nm.scan(hosts=ip_range, ports=ports, arguments='-sS -T4')
+            # Try TCP connect scan first (doesn't require root)
+            # -sT = TCP connect scan (safe for non-root users)
+            # -T4 = Aggressive timing template (faster)
+            scan_result = self.nm.scan(hosts=ip_range, ports=ports, arguments='-sT -T4')
             
             for host in scan_result['scan']:
                 host_info = scan_result['scan'][host]
@@ -153,7 +155,7 @@ class NetworkScanner:
                     'ip_address': host,
                     'hostname': host_info.get('hostname', None),
                     'status': 'inactive',
-                    'ssh_port': 22,
+                    'ssh_port': int(ports),
                     'error': None
                 }
                 
@@ -161,8 +163,9 @@ class NetworkScanner:
                 if host_info['status']['state'] == 'up':
                     # Check SSH port
                     tcp_ports = host_info.get('tcp', {})
-                    if 22 in tcp_ports:
-                        port_info = tcp_ports[22]
+                    port_num = int(ports)
+                    if port_num in tcp_ports:
+                        port_info = tcp_ports[port_num]
                         if port_info['state'] == 'open':
                             result['status'] = 'active'
                             result['ssh_banner'] = port_info.get('name', 'ssh')
@@ -170,8 +173,43 @@ class NetworkScanner:
                 results.append(result)
         
         except Exception as e:
-            console.print(f"[red]Error during nmap scan: {e}[/red]")
-            return []
+            error_msg = str(e)
+            if 'root privileges' in error_msg.lower() or 'requires root' in error_msg.lower():
+                console.print(f"[yellow]Nmap requires root privileges for advanced scans. Using TCP connect scan...[/yellow]")
+                try:
+                    # Fallback to basic TCP connect scan without timing
+                    scan_result = self.nm.scan(hosts=ip_range, ports=ports, arguments='-sT')
+                    
+                    for host in scan_result['scan']:
+                        host_info = scan_result['scan'][host]
+                        
+                        result = {
+                            'ip_address': host,
+                            'hostname': host_info.get('hostname', None),
+                            'status': 'inactive',
+                            'ssh_port': int(ports),
+                            'error': None
+                        }
+                        
+                        if host_info['status']['state'] == 'up':
+                            tcp_ports = host_info.get('tcp', {})
+                            port_num = int(ports)
+                            if port_num in tcp_ports:
+                                port_info = tcp_ports[port_num]
+                                if port_info['state'] == 'open':
+                                    result['status'] = 'active'
+                                    result['ssh_banner'] = port_info.get('name', 'ssh')
+                        
+                        results.append(result)
+                        
+                except Exception as fallback_error:
+                    console.print(f"[red]Nmap fallback scan also failed: {fallback_error}[/red]")
+                    logger.warning(f"Nmap scan failed completely: {fallback_error}")
+                    return []
+            else:
+                console.print(f"[red]Error during nmap scan: {e}[/red]")
+                logger.warning(f"Nmap scan failed: {e}")
+                return []
         
         return results
     
@@ -287,6 +325,27 @@ class NetworkScanner:
         console.print(f"[green]Scan complete: {len(active_hosts)} active SSH hosts found[/green]")
         
         return results
+    
+    def scan_range_with_nmap(self, ip_range: str, port: int = 22) -> List[Dict[str, Any]]:
+        """Scan IP range using nmap and return only active SSH hosts"""
+        
+        console.print(f"[cyan]Nmap scanning range: {ip_range} (port {port})[/cyan]")
+        
+        try:
+            # Use nmap to scan for active SSH hosts
+            results = self.nmap_scan(ip_range, str(port))
+            
+            # Filter to only return active hosts
+            active_hosts = [r for r in results if r['status'] == 'active']
+            
+            console.print(f"[green]Nmap scan complete: {len(active_hosts)} active SSH hosts found[/green]")
+            
+            return active_hosts
+            
+        except Exception as e:
+            console.print(f"[red]Nmap scan failed: {e}[/red]")
+            logger.error(f"Nmap scan error for {ip_range}: {e}")
+            return []
     
     def get_scan_summary(self, results: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Get summary statistics from scan results"""

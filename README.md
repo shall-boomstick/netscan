@@ -1,16 +1,17 @@
 # NetScan - SSH Network Scanner
 
-A powerful Python CLI tool for discovering and analyzing Linux servers with SSH capability. NetScan allows you to scan networks, collect system information, and generate comprehensive reports.
+A powerful Python CLI tool for discovering and analyzing Linux servers with SSH capability. NetScan allows you to scan networks, collect system information, and generate comprehensive reports with enterprise-grade features.
 
 ## Features
 
-- 🔍 **Network Discovery**: Scan IP ranges for SSH-enabled hosts
-- 🔐 **SSH Authentication**: Support for password and key-based authentication
+- 🔍 **Network Discovery**: Scan IP ranges for SSH-enabled hosts with optimized timeouts
+- 🔐 **Multiple Credentials**: Support for testing multiple username/password combinations
 - 📊 **System Information**: Collect OS, CPU, memory, and disk usage data
-- 💾 **Data Persistence**: SQLite database for storing scan results
+- ⚡ **Comprehensive Scanning**: Complete workflow in one command (`scan full`)
+- 💾 **Data Persistence**: SQLite database for storing scan results and authentication details
 - 📋 **Rich Reports**: Beautiful CLI output with filtering and export options
-- ⚡ **Concurrent Scanning**: Multi-threaded scanning for performance
-- 🔧 **Configuration Management**: Persistent settings and credentials
+- 🔧 **Configuration Management**: Persistent settings and secure credential storage
+- 🎯 **Optimized Performance**: Fast connection testing with configurable timeouts
 
 ## Installation
 
@@ -25,7 +26,7 @@ pip install -e .
 ### Dependencies
 
 - Python 3.8+
-- nmap (system package)
+- nmap (optional, for faster network discovery)
 
 Install nmap on your system:
 
@@ -42,44 +43,64 @@ brew install nmap
 
 ## Quick Start
 
+### Complete Network Analysis (Recommended)
+
+```bash
+# Create credentials file
+cat > credentials.txt << 'EOF'
+admin:admin
+admin:password
+root:root
+root:password
+ubuntu:ubuntu
+EOF
+
+# Run comprehensive scan (does everything in one command)
+python -m netscan scan full --range 192.168.1.0/24 --credentials-file credentials.txt
+```
+
 ### Basic Network Scan
 
 ```bash
 # Scan a subnet with credentials
-netscan scan --range 192.168.1.0/24 --username admin --password secret
+python -m netscan scan network --range 192.168.1.0/24 --username admin --password secret
 
-# Scan with custom SSH port
-netscan scan --range 10.0.0.0/16 --username root --port 2222
+# Scan with multiple credentials
+python -m netscan scan network --range 10.0.0.0/16 --multiple-usernames admin,root,user --multiple-passwords admin,password,123456
 ```
 
 ### Configuration Management
 
 ```bash
 # Set default credentials
-netscan config --set-username admin --set-password secret
+python -m netscan config set-credential username admin
+python -m netscan config set-credential password
 
 # View current configuration
-netscan config --show
+python -m netscan config show
 ```
 
 ### Generate Reports
 
 ```bash
 # View all discovered hosts
-netscan report --format table
+python -m netscan report hosts --format table
 
 # Filter by OS type
-netscan report --filter "os=ubuntu" --format table
+python -m netscan report hosts --filter "os=ubuntu" --format table
 
 # Export to JSON
-netscan report --format json --output results.json
+python -m netscan report export --format json --output results.json
 ```
 
 ## Usage
 
 ### Commands
 
-- `scan` - Discover and analyze SSH-enabled hosts
+- `scan full` - **Complete workflow**: Discovery → Authentication → Info Collection ⭐
+- `scan network` - Discover SSH-enabled hosts
+- `scan auth` - Test SSH authentication
+- `scan info` - Collect system information
 - `report` - Generate reports from stored data
 - `config` - Manage configuration settings
 - `database` - Database management operations
@@ -87,8 +108,9 @@ netscan report --format json --output results.json
 ### Scan Options
 
 - `--range`: IP range to scan (CIDR notation)
-- `--username`: SSH username
-- `--password`: SSH password
+- `--username` / `--multiple-usernames`: SSH username(s)
+- `--password` / `--multiple-passwords`: SSH password(s)
+- `--credentials-file`: File with username:password pairs
 - `--port`: SSH port (default: 22)
 - `--threads`: Number of concurrent threads
 - `--timeout`: Connection timeout in seconds
@@ -104,7 +126,7 @@ netscan report --format json --output results.json
 
 NetScan uses SQLite to store scan results with the following structure:
 
-- **hosts**: Host information and system details
+- **hosts**: Host information, system details, and authentication data
 - **scan_history**: Historical scan records
 - **config**: Application configuration
 

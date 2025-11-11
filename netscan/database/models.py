@@ -29,6 +29,12 @@ class Host(Base):
     memory_total = Column(Integer)  # in MB
     memory_used = Column(Integer)   # in MB
     disk_usage = Column(Text)       # JSON string for disk usage info
+    
+    # Authentication information
+    working_username = Column(String(100))  # Username that successfully authenticated
+    auth_method = Column(String(50))        # Authentication method used (password, key, etc.)
+    auth_attempts = Column(Integer)         # Number of authentication attempts
+    
     last_scan = Column(DateTime, default=datetime.utcnow, index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     
@@ -58,6 +64,9 @@ class Host(Base):
             'memory_total': self.memory_total,
             'memory_used': self.memory_used,
             'disk_usage': self.disk_usage,
+            'working_username': self.working_username,
+            'auth_method': self.auth_method,
+            'auth_attempts': self.auth_attempts,
             'last_scan': self.last_scan.isoformat() if self.last_scan else None,
             'created_at': self.created_at.isoformat() if self.created_at else None,
         }
