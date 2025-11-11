@@ -31,7 +31,7 @@ class ConfigManager:
                 'default_timeout': 5,
                 'default_threads': 10,
                 'use_nmap': True,
-                'max_retries': 3
+                'max_retries': 0
             },
             'ssh': {
                 'auth_timeout': 10,
@@ -242,6 +242,9 @@ class ConfigManager:
         
         if not (1 <= scanning.get('default_threads', 10) <= 100):
             scanning_errors.append("default_threads must be between 1 and 100")
+
+        if not (0 <= scanning.get('max_retries', 0) <= 10):
+            scanning_errors.append("max_retries must be between 0 and 10")
         
         if scanning_errors:
             errors['scanning'] = scanning_errors

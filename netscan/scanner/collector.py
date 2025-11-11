@@ -216,6 +216,19 @@ class SystemInfoCollector:
         }
         
         console.print(f"[blue]Collecting system information from {host}...[/blue]")
+
+        # Quick authentication check to avoid retrying every command on failure
+        connection_check = self.ssh_connector.test_connection(
+            host, port, username, password, key_file
+        )
+
+        if not connection_check.get('connected'):
+            error_message = connection_check.get('error') or "Authentication failed"
+            info['collection_errors'].append(error_message)
+            info['collection_errors'].append("Aborted detailed collection because initial authentication failed.")
+            logger.warning(f"Skipping system info collection for {host}: {error_message}")
+            console.print(f"[red]✗ Authentication failed for {host}: {error_message}[/red]")
+            return info
         
         # Execute all commands
         for info_type, command in self.commands.items():
@@ -323,11 +336,15 @@ class SystemInfoCollector:
     
     def format_system_info(self, info: Dict[str, Any]) -> str:
         """Format system information for display"""
-        if not info['collection_success']:
+        if not info['collection_success'] and not info['parsed_info']:
             return f"Failed to collect system information from {info['host']}"
         
         parsed = info['parsed_info']
         output = []
+        
+        if not info['collection_success']:
+            output.append("Partial data: some collection commands failed; missing fields may appear as 'Unknown'.")
+            output.append("")
         
         output.append(f"System Information for {info['host']}")
         output.append("=" * 50)

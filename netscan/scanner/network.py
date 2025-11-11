@@ -16,7 +16,7 @@ import time
 from ..utils.logging import get_logger, get_network_logger, LoggingContext
 from ..utils.error_handling import (
     NetworkError, ConnectionTimeoutError, HostUnreachableError,
-    retry_operation, RetryConfig, GracefulErrorHandler, map_exception
+    GracefulErrorHandler, map_exception
 )
 
 logger = get_logger("scanner.network")
@@ -27,9 +27,10 @@ console = Console()
 class NetworkScanner:
     """Network scanner class for discovering SSH-enabled hosts"""
     
-    def __init__(self, timeout: int = 5, threads: int = 10):
+    def __init__(self, timeout: int = 5, threads: int = 10, max_retries: int = 0):
         self.timeout = timeout
         self.threads = threads
+        self.max_retries = max(0, max_retries or 0)
         self.nm = nmap.PortScanner()
     
     def validate_ip_range(self, ip_range: str) -> bool:
@@ -53,9 +54,28 @@ class NetworkScanner:
             except ValueError:
                 return []
     
-    @retry_operation(RetryConfig(max_attempts=2, base_delay=0.5))
     def check_ssh_port(self, ip: str, port: int = 22) -> Dict[str, Any]:
-        """Check if SSH port is open on a specific host"""
+        """Check if SSH port is open on a specific host with configurable retries"""
+        attempt = 0
+
+        while True:
+            try:
+                return self._check_ssh_port_once(ip, port)
+            except (ConnectionTimeoutError, HostUnreachableError, NetworkError) as exc:
+                if attempt < self.max_retries:
+                    attempt += 1
+                    logger.debug(f"Retrying {ip}:{port} due to {exc.__class__.__name__} ({attempt}/{self.max_retries})")
+                    continue
+                raise
+            except Exception as exc:
+                if attempt < self.max_retries:
+                    attempt += 1
+                    logger.debug(f"Retrying {ip}:{port} due to unexpected error {exc} ({attempt}/{self.max_retries})")
+                    continue
+                raise
+
+    def _check_ssh_port_once(self, ip: str, port: int = 22) -> Dict[str, Any]:
+        """Single attempt to check if SSH port is open"""
         result = {
             'ip_address': ip,
             'ssh_port': port,
