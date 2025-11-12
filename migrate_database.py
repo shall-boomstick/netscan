@@ -44,6 +44,10 @@ def migrate_database():
             print("Adding auth_attempts column...")
             cursor.execute("ALTER TABLE hosts ADD COLUMN auth_attempts INTEGER")
         
+        if 'open_ports' not in columns:
+            print("Adding open_ports column...")
+            cursor.execute("ALTER TABLE hosts ADD COLUMN open_ports TEXT")
+        
         # Commit the changes
         conn.commit()
         print("Database migration completed successfully!")

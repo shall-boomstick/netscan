@@ -12,6 +12,7 @@ A powerful Python CLI tool for discovering and analyzing Linux servers with SSH 
 - 📋 **Rich Reports**: Beautiful CLI output with filtering and export options
 - 🔧 **Configuration Management**: Persistent settings and secure credential storage
 - 🎯 **Optimized Performance**: Fast connection testing with configurable timeouts
+- 🔦 **Additional Port Discovery**: Probe configurable TCP ports alongside SSH for richer host context
 
 ## Installation
 
@@ -46,8 +47,8 @@ brew install nmap
 ### Complete Network Analysis (Recommended)
 
 ```bash
-# Create credentials file
-cat > credentials.txt << 'EOF'
+# Create a credentials file with multiple username/password pairs
+cat > credentials.txt <<'EOF'
 admin:admin
 admin:password
 root:root
@@ -55,72 +56,129 @@ root:password
 ubuntu:ubuntu
 EOF
 
-# Run comprehensive scan (does everything in one command)
+# Run the entire workflow (discovery → auth → info → storage) in one command
 python -m netscan scan full --range 192.168.1.0/24 --credentials-file credentials.txt
 ```
 
-### Basic Network Scan
+### Classic Step-by-Step Workflow
+
+1. **Store credentials (optional).** When values are omitted NetScan prompts securely and persists them:
+
+   ```bash
+   python -m netscan config set-credential username ubuntu
+   python -m netscan config set-credential password
+   ```
+
+2. **Discover SSH endpoints.** Reuse stored credentials or supply them inline; tune timeouts/retries as needed:
+
+   ```bash
+   python -m netscan scan network --range 192.168.1.0/24 --timeout 2 --threads 25 --retries 0
+   ```
+
+3. **Authenticate against hosts.** Try single or multiple credentials and persist working pairs to the database:
+
+   ```bash
+   python -m netscan scan auth --from-db --multiple-usernames admin,root,user \
+       --multiple-passwords admin,password,123456 --try-multiple-credentials
+   ```
+
+4. **Collect system information** (CPU, memory, disk, uptime) and store the results:
+
+   ```bash
+   python -m netscan scan info --from-db --credentials-file credentials.txt \
+       --try-multiple-credentials --store-db
+   ```
+
+5. **Review or export the data:**
+
+   ```bash
+   python -m netscan report hosts --format table
+   python -m netscan report summary
+   python -m netscan report export --format json --output results.json
+   ```
+
+### Configuration Management Highlights
+
+- Dot-notation mirrors the config structure and keeps legacy aliases working:
+
+  ```bash
+  python -m netscan config set scanning.default_timeout 2
+  python -m netscan config set scanning.max_retries 1
+  ```
+
+- Credential helpers remain available:
+
+  ```bash
+  python -m netscan config set-credential ssh_key_path /home/user/.ssh/id_rsa
+  python -m netscan config list-credentials
+  python -m netscan config show
+  ```
+
+- Additional port scanning is easily configured:
+
+  ```bash
+  python -m netscan config set --set-additional-ports 80,443,3389
+  python -m netscan config set scanning.additional_ports 5900
+  ```
+
+### Reporting Shortcuts
 
 ```bash
-# Scan a subnet with credentials
-python -m netscan scan network --range 192.168.1.0/24 --username admin --password secret
+# Filter hosts by OS substring and show the newest first
+python -m netscan report hosts --filter "os=ubuntu" --sort last_scan
 
-# Scan with multiple credentials
-python -m netscan scan network --range 10.0.0.0/16 --multiple-usernames admin,root,user --multiple-passwords admin,password,123456
-```
-
-### Configuration Management
-
-```bash
-# Set default credentials
-python -m netscan config set-credential username admin
-python -m netscan config set-credential password
-
-# View current configuration
-python -m netscan config show
-```
-
-### Generate Reports
-
-```bash
-# View all discovered hosts
-python -m netscan report hosts --format table
-
-# Filter by OS type
-python -m netscan report hosts --filter "os=ubuntu" --format table
-
-# Export to JSON
-python -m netscan report export --format json --output results.json
+# Export hosts as CSV and include scan history in JSON
+python -m netscan report export --format csv --output hosts.csv
+python -m netscan report export --include-history --output hosts.json
 ```
 
 ## Usage
 
-### Commands
+### Command Groups
 
-- `scan full` - **Complete workflow**: Discovery → Authentication → Info Collection ⭐
-- `scan network` - Discover SSH-enabled hosts
-- `scan auth` - Test SSH authentication
-- `scan info` - Collect system information
-- `report` - Generate reports from stored data
-- `config` - Manage configuration settings
-- `database` - Database management operations
+- `scan full` – **Complete workflow** (Discovery → Authentication → Info Collection) ⭐
+- `scan network` – Discover SSH-enabled hosts and populate the inventory
+- `scan auth` – Test SSH authentication (single or multiple credentials)
+- `scan info` – Collect detailed system information
+- `report` – Generate and export reports
+- `config` – Manage configuration settings and stored credentials
+- `database` – Maintenance utilities (backup, vacuum, restore)
 
-### Scan Options
+| Command | Description |
+|---------|-------------|
+| `python -m netscan scan network` | Discover SSH endpoints, auto-updating the host inventory. |
+| `python -m netscan scan auth` | Test authentication (password/key/agent or credential lists) against known hosts. |
+| `python -m netscan scan info` | Collect OS/CPU/memory/disk details; partial successes still update the DB. |
+| `python -m netscan report hosts` | Render hosts in table/json/csv/text with filter, sort, limit controls. |
+| `python -m netscan report summary` | Show aggregated host stats, OS distribution, recent activity. |
+| `python -m netscan report export` | Export hosts (and optionally history) to json/csv/xml/txt/sql. |
+| `python -m netscan config ...` | Manage configuration and credentials (supports aliases and dot keys). |
+| `python -m netscan database ...` | Maintenance utilities (backup, vacuum, restore). |
 
-- `--range`: IP range to scan (CIDR notation)
-- `--username` / `--multiple-usernames`: SSH username(s)
-- `--password` / `--multiple-passwords`: SSH password(s)
-- `--credentials-file`: File with username:password pairs
-- `--port`: SSH port (default: 22)
-- `--threads`: Number of concurrent threads
-- `--timeout`: Connection timeout in seconds
+### Key Scan Options
 
-### Report Options
+- `--range / -r`: IP range to scan (CIDR or single IP, required for `scan network`).
+- `--username / -u`: SSH username (optional for network discovery; required for single-credential auth/info).
+- `--multiple-usernames`: Comma-separated usernames to iterate through.
+- `--password / -p`: SSH password; omit value to prompt securely and fall back to stored secrets if available.
+- `--multiple-passwords`: Comma-separated passwords matching `--multiple-usernames`.
+- `--credentials-file`: Path to username:password pairs (one per line).
+- `--key-file / -k`: Path to SSH private key.
+- `--port / -P`: SSH port (default 22).
+- `--threads / -t`: Concurrent workers (1–100, defaults to config `scanning.default_threads`).
+- `--timeout / -T`: Socket/SSH timeout in seconds (1–300).
+- `--retries / -R`: Number of retries for unreachable hosts during network scans (0–10, default from config).
+- `--try-multiple-credentials`: Enable the multi-credential authentication/collection workflow.
+- `--no-nmap`: Skip the nmap pre-scan and force socket-only discovery.
+- `--store-db`: Persist info-collection results (complete and partial datasets) to the database.
 
-- `--filter`: Filter results (e.g., "os=ubuntu", "status=active")
-- `--format`: Output format (table, json, csv)
-- `--output`: Output file path
-- `--sort`: Sort by field
+### Report Options Snapshot
+
+- `--filter`: `key=value` filter (`status`, `os`, `ip`, `hostname`, `port` for hosts; similar patterns elsewhere).
+- `--format / --Format`: Switch output between table/json/csv/text.
+- `--output`: Write report/export to file.
+- `--sort`: Sort column (e.g., `last_scan`, `ip_address`).
+- `--limit`: Cap the number of rows displayed.
 
 ## Database Schema
 
@@ -137,7 +195,7 @@ See [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md) for detailed architecture and dev
 ### Running Tests
 
 ```bash
-python -m pytest tests/
+./venv/bin/pytest
 ```
 
 ### Contributing

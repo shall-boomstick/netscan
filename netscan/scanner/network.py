@@ -16,7 +16,7 @@ import time
 from ..utils.logging import get_logger, get_network_logger, LoggingContext
 from ..utils.error_handling import (
     NetworkError, ConnectionTimeoutError, HostUnreachableError,
-    retry_operation, RetryConfig, GracefulErrorHandler, map_exception
+    GracefulErrorHandler, map_exception
 )
 
 logger = get_logger("scanner.network")
@@ -27,10 +27,44 @@ console = Console()
 class NetworkScanner:
     """Network scanner class for discovering SSH-enabled hosts"""
     
-    def __init__(self, timeout: int = 3, threads: int = 10):
+    def __init__(
+        self,
+        timeout: int = 3,
+        threads: int = 10,
+        max_retries: int = 0,
+        additional_ports: Optional[List[int]] = None,
+    ):
         self.timeout = timeout
         self.threads = threads
+        self.max_retries = max(0, max_retries or 0)
+        self.additional_ports = self._sanitize_ports(additional_ports or [])
         self.nm = nmap.PortScanner()
+    
+    def _sanitize_ports(self, ports: List[int]) -> List[int]:
+        """Sanitize a collection of ports into a unique, sorted list"""
+        normalized = []
+        for candidate in ports:
+            try:
+                port = int(candidate)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= port <= 65535 and port not in normalized:
+                normalized.append(port)
+        return sorted(normalized)
+    
+    def _build_port_list(self, primary_port: int, extra_ports: Optional[List[int]] = None) -> List[int]:
+        """Combine primary port with configured extra ports"""
+        ports = []
+        if primary_port and primary_port not in ports:
+            ports.append(primary_port)
+        for port in (extra_ports if extra_ports is not None else self.additional_ports):
+            if port not in ports:
+                ports.append(port)
+        return sorted(ports)
+    
+    def _should_capture_banner(self, port: int) -> bool:
+        """Determine whether we should attempt to capture a service banner"""
+        return port == 22
     
     def validate_ip_range(self, ip_range: str) -> bool:
         """Validate IP range format"""
@@ -53,12 +87,32 @@ class NetworkScanner:
             except ValueError:
                 return []
     
-    @retry_operation(RetryConfig(max_attempts=2, base_delay=0.5))
     def check_ssh_port(self, ip: str, port: int = 22) -> Dict[str, Any]:
-        """Check if SSH port is open on a specific host"""
+        """Check if SSH port is open on a specific host with configurable retries"""
+        attempt = 0
+
+        while True:
+            try:
+                return self._check_ssh_port_once(ip, port)
+            except (ConnectionTimeoutError, HostUnreachableError, NetworkError) as exc:
+                if attempt < self.max_retries:
+                    attempt += 1
+                    logger.debug(f"Retrying {ip}:{port} due to {exc.__class__.__name__} ({attempt}/{self.max_retries})")
+                    continue
+                raise
+            except Exception as exc:
+                if attempt < self.max_retries:
+                    attempt += 1
+                    logger.debug(f"Retrying {ip}:{port} due to unexpected error {exc} ({attempt}/{self.max_retries})")
+                    continue
+                raise
+
+    def _check_ssh_port_once(self, ip: str, port: int = 22) -> Dict[str, Any]:
+        """Single attempt to check if SSH port is open"""
         result = {
             'ip_address': ip,
             'ssh_port': port,
+            'port': port,
             'status': 'inactive',
             'hostname': None,
             'error': None,
@@ -91,14 +145,15 @@ class NetworkScanner:
                         logger.debug(f"Could not resolve hostname for {ip}: {e}")
                     
                     # Try to get SSH banner
-                    try:
-                        sock.settimeout(3)  # Shorter timeout for banner
-                        banner = sock.recv(1024).decode().strip()
-                        result['ssh_banner'] = banner
-                        logger.debug(f"SSH banner for {ip}: {banner}")
-                    except Exception as e:
-                        result['ssh_banner'] = None
-                        logger.debug(f"Could not get SSH banner for {ip}: {e}")
+                    if self._should_capture_banner(port):
+                        try:
+                            sock.settimeout(3)  # Shorter timeout for banner
+                            banner = sock.recv(1024).decode(errors="ignore").strip()
+                            result['ssh_banner'] = banner
+                            logger.debug(f"SSH banner for {ip}: {banner}")
+                        except Exception as e:
+                            result['ssh_banner'] = None
+                            logger.debug(f"Could not get SSH banner for {ip}: {e}")
                 else:
                     network_logger.log_connection_failure(ip, port, f"Connection refused (code: {connection_result})", duration)
                 
@@ -136,41 +191,56 @@ class NetworkScanner:
         result['response_time'] = time.time() - start_time
         return result
     
-    def nmap_scan(self, ip_range: str, ports: str = "22") -> List[Dict[str, Any]]:
+    def nmap_scan(
+        self,
+        ip_range: str,
+        primary_port: int = 22,
+        extra_ports: Optional[List[int]] = None,
+    ) -> List[Dict[str, Any]]:
         """Perform nmap scan on IP range"""
-        results = []
+        port_list = self._build_port_list(primary_port, extra_ports)
+        if not port_list:
+            port_list = [primary_port]
+        ports_arg = ",".join(str(p) for p in port_list)
+        
+        def process_scan(scan_output) -> List[Dict[str, Any]]:
+            processed_results: List[Dict[str, Any]] = []
+            for host in scan_output.get('scan', {}):
+                host_info = scan_output['scan'][host]
+                entry = {
+                    'ip_address': host,
+                    'hostname': host_info.get('hostname', None),
+                    'status': 'inactive',
+                    'ssh_port': primary_port,
+                    'port': primary_port,
+                    'error': None,
+                    'open_ports': [],
+                    'ports_scanned': list(port_list),
+                }
+                
+                if host_info['status']['state'] == 'up':
+                    tcp_ports = host_info.get('tcp', {})
+                    for port in port_list:
+                        port_info = tcp_ports.get(port)
+                        if port_info and port_info.get('state') == 'open':
+                            service = port_info.get('name')
+                            entry['open_ports'].append({'port': port, 'service': service})
+                            if port == primary_port:
+                                entry['status'] = 'active'
+                                entry['ssh_banner'] = service
+                processed_results.append(entry)
+            return processed_results
+        
+        results: List[Dict[str, Any]] = []
         
         try:
-            console.print(f"[yellow]Running nmap scan on {ip_range}...[/yellow]")
+            console.print(f"[yellow]Running nmap scan on {ip_range} (ports: {ports_arg})...[/yellow]")
             
             # Try TCP connect scan first (doesn't require root)
             # -sT = TCP connect scan (safe for non-root users)
             # -T4 = Aggressive timing template (faster)
-            scan_result = self.nm.scan(hosts=ip_range, ports=ports, arguments='-sT -T4')
-            
-            for host in scan_result['scan']:
-                host_info = scan_result['scan'][host]
-                
-                result = {
-                    'ip_address': host,
-                    'hostname': host_info.get('hostname', None),
-                    'status': 'inactive',
-                    'ssh_port': int(ports),
-                    'error': None
-                }
-                
-                # Check if host is up
-                if host_info['status']['state'] == 'up':
-                    # Check SSH port
-                    tcp_ports = host_info.get('tcp', {})
-                    port_num = int(ports)
-                    if port_num in tcp_ports:
-                        port_info = tcp_ports[port_num]
-                        if port_info['state'] == 'open':
-                            result['status'] = 'active'
-                            result['ssh_banner'] = port_info.get('name', 'ssh')
-                
-                results.append(result)
+            scan_result = self.nm.scan(hosts=ip_range, ports=ports_arg, arguments='-sT -T4')
+            results = process_scan(scan_result)
         
         except Exception as e:
             error_msg = str(e)
@@ -178,30 +248,8 @@ class NetworkScanner:
                 console.print(f"[yellow]Nmap requires root privileges for advanced scans. Using TCP connect scan...[/yellow]")
                 try:
                     # Fallback to basic TCP connect scan without timing
-                    scan_result = self.nm.scan(hosts=ip_range, ports=ports, arguments='-sT')
-                    
-                    for host in scan_result['scan']:
-                        host_info = scan_result['scan'][host]
-                        
-                        result = {
-                            'ip_address': host,
-                            'hostname': host_info.get('hostname', None),
-                            'status': 'inactive',
-                            'ssh_port': int(ports),
-                            'error': None
-                        }
-                        
-                        if host_info['status']['state'] == 'up':
-                            tcp_ports = host_info.get('tcp', {})
-                            port_num = int(ports)
-                            if port_num in tcp_ports:
-                                port_info = tcp_ports[port_num]
-                                if port_info['state'] == 'open':
-                                    result['status'] = 'active'
-                                    result['ssh_banner'] = port_info.get('name', 'ssh')
-                        
-                        results.append(result)
-                        
+                    scan_result = self.nm.scan(hosts=ip_range, ports=ports_arg, arguments='-sT')
+                    results = process_scan(scan_result)
                 except Exception as fallback_error:
                     console.print(f"[red]Nmap fallback scan also failed: {fallback_error}[/red]")
                     logger.warning(f"Nmap scan failed completely: {fallback_error}")
@@ -252,8 +300,8 @@ class NetworkScanner:
                             # Show active hosts
                             if result['status'] == 'active':
                                 active_count += 1
-                                console.print(f"[green]✓ Found SSH: {result['ip_address']}:{result['ssh_port']}[/green]")
-                                logger.info(f"Active SSH host found: {result['ip_address']}:{result['ssh_port']}")
+                                console.print(f"[green]✓ Open port {result['port']} detected on {result['ip_address']}[/green]")
+                                logger.info(f"Active port found: {result['ip_address']}:{result['port']}")
                             elif result['status'] == 'timeout':
                                 logger.debug(f"Timeout scanning {ip}:{port}")
                             elif result['status'] == 'error':
@@ -273,6 +321,7 @@ class NetworkScanner:
                             error_result = {
                                 'ip_address': ip,
                                 'ssh_port': port,
+                                'port': port,
                                 'status': 'error',
                                 'hostname': None,
                                 'error': str(e),
@@ -301,10 +350,15 @@ class NetworkScanner:
         console.print(f"[cyan]Timeout: {self.timeout}s[/cyan]")
         console.print(f"[cyan]Threads: {self.threads}[/cyan]")
         
+        port_list = self._build_port_list(port)
+        additional_only = [p for p in port_list if p != port]
+        if additional_only:
+            console.print(f"[cyan]Additional ports: {', '.join(str(p) for p in additional_only)}[/cyan]")
+        
         # Try nmap first (if available and requested)
         if use_nmap:
             try:
-                results = self.nmap_scan(ip_range, str(port))
+                results = self.nmap_scan(ip_range, primary_port=port, extra_ports=self.additional_ports)
                 if results:
                     console.print(f"[green]Found {len([r for r in results if r['status'] == 'active'])} active SSH hosts[/green]")
                     return results
@@ -318,7 +372,48 @@ class NetworkScanner:
             return []
         
         console.print(f"[yellow]Performing socket scan on {len(ip_list)} hosts[/yellow]")
-        results = self.concurrent_scan(ip_list, port)
+        host_results: Dict[str, Dict[str, Any]] = {}
+        
+        for scan_port in port_list:
+            port_results = self.concurrent_scan(ip_list, scan_port)
+            for result in port_results:
+                ip_addr = result['ip_address']
+                entry = host_results.setdefault(ip_addr, {
+                    'ip_address': ip_addr,
+                    'hostname': result.get('hostname'),
+                    'status': 'inactive',
+                    'ssh_port': port,
+                    'port': port,
+                    'error': None,
+                    'open_ports': [],
+                    'ports_scanned': [],
+                    'timeouts': [],
+                    'errors': [],
+                    'response_times': {}
+                })
+                
+                if result.get('hostname') and not entry.get('hostname'):
+                    entry['hostname'] = result.get('hostname')
+                
+                if scan_port not in entry['ports_scanned']:
+                    entry['ports_scanned'].append(scan_port)
+                
+                if result['status'] == 'active':
+                    service = result.get('ssh_banner') if scan_port == port else None
+                    entry['open_ports'].append({'port': scan_port, 'service': service})
+                    if scan_port == port:
+                        entry['status'] = 'active'
+                        if service:
+                            entry['ssh_banner'] = service
+                elif result['status'] == 'timeout':
+                    entry['timeouts'].append(scan_port)
+                elif result['status'] == 'error':
+                    entry['errors'].append({'port': scan_port, 'error': result.get('error')})
+                
+                if result.get('response_time') is not None:
+                    entry['response_times'][scan_port] = result['response_time']
+        
+        results = list(host_results.values())
         
         # Summary
         active_hosts = [r for r in results if r['status'] == 'active']
@@ -329,11 +424,13 @@ class NetworkScanner:
     def scan_range_with_nmap(self, ip_range: str, port: int = 22) -> List[Dict[str, Any]]:
         """Scan IP range using nmap and return only active SSH hosts"""
         
-        console.print(f"[cyan]Nmap scanning range: {ip_range} (port {port})[/cyan]")
+        port_list = self._build_port_list(port)
+        ports_display = ", ".join(str(p) for p in port_list)
+        console.print(f"[cyan]Nmap scanning range: {ip_range} (ports: {ports_display})[/cyan]")
         
         try:
             # Use nmap to scan for active SSH hosts
-            results = self.nmap_scan(ip_range, str(port))
+            results = self.nmap_scan(ip_range, primary_port=port, extra_ports=self.additional_ports)
             
             # Filter to only return active hosts
             active_hosts = [r for r in results if r['status'] == 'active']

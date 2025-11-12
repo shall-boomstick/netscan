@@ -5,6 +5,7 @@ Main CLI entry point using Click
 """
 
 import click
+import json
 from rich.console import Console
 from rich.text import Text
 from rich.panel import Panel
@@ -50,17 +51,20 @@ def scan(ctx):
 @click.option('--username', '-u', 
               help='SSH username (can be set in config)')
 @click.option('--password', '-p', 
-              help='SSH password (can be set in config)')
+              help='SSH password (can be set in config)',
+              prompt=True, hide_input=True, prompt_required=False)
 @click.option('--port', '-P', default=22, 
               help='SSH port (default: 22)')
 @click.option('--threads', '-t', default=10, 
               help='Number of concurrent threads (default: 10)')
 @click.option('--timeout', '-T', default=5, 
               help='Connection timeout in seconds (default: 5)')
+@click.option('--retries', '-R', type=int, 
+              help='Number of retry attempts for unreachable hosts (default from config)')
 @click.option('--no-nmap', is_flag=True, 
               help='Skip nmap scan and use socket scan only')
 @click.pass_context
-def network(ctx, range, username, password, port, threads, timeout, no_nmap):
+def network(ctx, range, username, password, port, threads, timeout, retries, no_nmap):
     """Scan network range for SSH-enabled hosts"""
     
     # Welcome message
@@ -68,6 +72,25 @@ def network(ctx, range, username, password, port, threads, timeout, no_nmap):
         Text("NetScan - Network Scanner", style="bold cyan"),
         border_style="cyan"
     ))
+    
+    # Load stored defaults if explicit values not provided
+    from .config import config_manager
+    used_stored_username = False
+    used_stored_password = False
+
+    if not username:
+        stored_username = config_manager.get_credential_value('username')
+        if stored_username:
+            username = stored_username
+            used_stored_username = True
+
+    if not password:
+        stored_password = config_manager.get_credential_value('password')
+        if stored_password:
+            password = stored_password
+            used_stored_password = True
+    
+    additional_ports = config_manager.get_additional_ports()
     
     # Validate inputs
     if not validate_ip_range(range):
@@ -85,6 +108,17 @@ def network(ctx, range, username, password, port, threads, timeout, no_nmap):
     if not validate_timeout(timeout):
         console.print(f"[red]Error: Invalid timeout: {timeout} (must be 1-300 seconds)[/red]")
         sys.exit(1)
+
+    # Determine retries
+    if retries is None:
+        retries = config_manager.get('scanning', 'max_retries', 0)
+    try:
+        retries = int(retries)
+        if retries < 0 or retries > 10:
+            raise ValueError
+    except (TypeError, ValueError):
+        console.print(f"[red]Error: Invalid retry count: {retries} (must be 0-10)[/red]")
+        sys.exit(1)
     
     # Check for username/password (optional for network scan)
     if username and not validate_username(username):
@@ -95,15 +129,23 @@ def network(ctx, range, username, password, port, threads, timeout, no_nmap):
     console.print(f"[green]SSH port:[/green] {port}")
     console.print(f"[green]Threads:[/green] {threads}")
     console.print(f"[green]Timeout:[/green] {timeout}s")
+    console.print(f"[green]Retries:[/green] {retries}")
     
     if username:
-        console.print(f"[green]Username:[/green] {username}")
+        suffix = " [dim](stored)[/dim]" if used_stored_username else ""
+        console.print(f"[green]Username:[/green] {username}{suffix}")
     if password:
-        console.print("[yellow]Password:[/yellow] [redacted]")
+        suffix = " [dim](stored)[/dim]" if used_stored_password else ""
+        console.print(f"[yellow]Password:[/yellow] [redacted]{suffix}")
     
     try:
         # Initialize scanner
-        scanner = NetworkScanner(timeout=timeout, threads=threads)
+        scanner = NetworkScanner(
+            timeout=timeout,
+            threads=threads,
+            max_retries=retries,
+            additional_ports=additional_ports,
+        )
         
         # Perform network scan
         results = scanner.scan_range(range, port=port, use_nmap=not no_nmap)
@@ -124,6 +166,40 @@ def network(ctx, range, username, password, port, threads, timeout, no_nmap):
         console.print(f"[red]Timeout hosts:[/red] {summary['timeout_hosts']}")
         console.print(f"[cyan]Success rate:[/cyan] {summary['success_rate']:.1f}%")
         
+        if additional_ports:
+            from rich.table import Table
+            
+            extra_port_counts = {}
+            host_port_rows = []
+            for host_result in results:
+                extra_open = [
+                    str(port_info['port'])
+                    for port_info in host_result.get('open_ports', [])
+                    if port_info['port'] != port
+                ]
+                for port_num in extra_open:
+                    extra_port_counts[port_num] = extra_port_counts.get(port_num, 0) + 1
+                if extra_open:
+                    host_port_rows.append((host_result['ip_address'], ", ".join(sorted(extra_open))))
+            
+            console.print("\n[bold blue]Additional Port Findings[/bold blue]")
+            if extra_port_counts:
+                summary_table = Table(show_header=True, header_style="bold magenta")
+                summary_table.add_column("Port", justify="right")
+                summary_table.add_column("Open Hosts", justify="right")
+                for port_num, count in sorted(extra_port_counts.items(), key=lambda item: int(item[0])):
+                    summary_table.add_row(str(port_num), str(count))
+                console.print(summary_table)
+                
+                host_table = Table(show_header=True, header_style="bold cyan")
+                host_table.add_column("Host")
+                host_table.add_column("Open Additional Ports")
+                for ip_address, ports_str in sorted(host_port_rows):
+                    host_table.add_row(ip_address, ports_str)
+                console.print(host_table)
+            else:
+                console.print("[cyan]No additional ports were detected as open.[/cyan]")
+        
         # Store results in database
         active_hosts = [r for r in results if r['status'] == 'active']
         if active_hosts:
@@ -133,11 +209,13 @@ def network(ctx, range, username, password, port, threads, timeout, no_nmap):
             
             for host_result in active_hosts:
                 # Prepare host data for database
+                open_ports_payload = host_result.get('open_ports', [])
                 host_data = {
                     'ip_address': host_result['ip_address'],
                     'hostname': host_result.get('hostname'),
                     'ssh_port': host_result['ssh_port'],
-                    'status': 'active'
+                    'status': 'active',
+                    'open_ports': json.dumps(open_ports_payload)
                 }
                 
                 # Create or update host in database
@@ -163,8 +241,8 @@ def network(ctx, range, username, password, port, threads, timeout, no_nmap):
 @scan.command()
 @click.option('--hosts', '-h', help='Comma-separated list of IP addresses/hostnames')
 @click.option('--from-db', is_flag=True, help='Use hosts from database')
-@click.option('--username', '-u', help='SSH username')
-@click.option('--password', '-p', help='SSH password')
+@click.option('--username', '-u', help='SSH username (falls back to stored credential)')
+@click.option('--password', '-p', help='SSH password (falls back to stored credential)')
 @click.option('--key-file', '-k', help='SSH private key file path')
 @click.option('--multiple-usernames', help='Comma-separated list of usernames to try')
 @click.option('--multiple-passwords', help='Comma-separated list of passwords to try')
@@ -227,7 +305,30 @@ def auth(ctx, hosts, from_db, username, password, key_file, multiple_usernames, 
         console.print("[yellow]No hosts to test[/yellow]")
         return
     
-    # Parse and validate credentials
+    from .config import config_manager
+    used_stored_username = False
+    used_stored_password = False
+    used_stored_key = False
+    
+    if not username:
+        stored_username = config_manager.get_credential_value('username')
+        if stored_username:
+            username = stored_username
+            used_stored_username = True
+    
+    if not password:
+        stored_password = config_manager.get_credential_value('password')
+        if stored_password:
+            password = stored_password
+            used_stored_password = True
+    
+    if not key_file:
+        stored_key = config_manager.get_credential_value('ssh_key_path')
+        if stored_key:
+            key_file = stored_key
+            used_stored_key = True
+    
+    # Prepare credential list holder for multi-credential mode
     credentials_list = []
     
     if try_multiple_credentials:
@@ -301,8 +402,18 @@ def auth(ctx, hosts, from_db, username, password, key_file, multiple_usernames, 
             sys.exit(1)
         
         if not password and not key_file and not try_all_methods:
-            console.print("[red]Error: Must provide --password, --key-file, or --try-all-methods[/red]")
-            sys.exit(1)
+            # Prompt user (legacy behaviour) if no stored credential available
+            password = click.prompt(
+                "Enter SSH password",
+                hide_input=True,
+                show_default=False,
+                default=""
+            )
+            if password:
+                console.print("[yellow]Password captured from prompt[/yellow]")
+            else:
+                console.print("[red]Error: Must provide --password, --key-file, or --try-all-methods[/red]")
+                sys.exit(1)
     
     # Display configuration
     console.print(f"[green]SSH port:[/green] {port}")
@@ -312,11 +423,14 @@ def auth(ctx, hosts, from_db, username, password, key_file, multiple_usernames, 
     if try_multiple_credentials:
         console.print(f"[green]Credentials:[/green] {len(credentials_list)} credential pairs")
     else:
-        console.print(f"[green]Username:[/green] {username}")
+        username_suffix = " [dim](stored)[/dim]" if used_stored_username else ""
+        console.print(f"[green]Username:[/green] {username}{username_suffix}")
         if password:
-            console.print("[yellow]Password:[/yellow] [redacted]")
+            password_suffix = " [dim](stored)[/dim]" if used_stored_password else ""
+            console.print(f"[yellow]Password:[/yellow] [redacted]{password_suffix}")
         if key_file:
-            console.print(f"[yellow]Key file:[/yellow] {key_file}")
+            key_suffix = " [dim](stored)[/dim]" if used_stored_key else ""
+            console.print(f"[yellow]Key file:[/yellow] {key_file}{key_suffix}")
         if try_all_methods:
             console.print("[yellow]Will try all available authentication methods[/yellow]")
     
@@ -401,8 +515,8 @@ def auth(ctx, hosts, from_db, username, password, key_file, multiple_usernames, 
 @scan.command()
 @click.option('--hosts', '-h', help='Comma-separated list of IP addresses/hostnames')
 @click.option('--from-db', is_flag=True, help='Use hosts from database')
-@click.option('--username', '-u', help='SSH username')
-@click.option('--password', '-p', help='SSH password')
+@click.option('--username', '-u', help='SSH username (falls back to stored credential)')
+@click.option('--password', '-p', help='SSH password (falls back to stored credential)')
 @click.option('--key-file', '-k', help='SSH private key file path')
 @click.option('--multiple-usernames', help='Comma-separated list of usernames to try')
 @click.option('--multiple-passwords', help='Comma-separated list of passwords to try')
@@ -462,7 +576,29 @@ def info(ctx, hosts, from_db, username, password, key_file, multiple_usernames, 
         console.print("[yellow]No hosts to collect information from[/yellow]")
         return
     
-    # Parse and validate credentials
+    from .config import config_manager
+    used_stored_username = False
+    used_stored_password = False
+    used_stored_key = False
+
+    if not username:
+        stored_username = config_manager.get_credential_value('username')
+        if stored_username:
+            username = stored_username
+            used_stored_username = True
+
+    if not password:
+        stored_password = config_manager.get_credential_value('password')
+        if stored_password:
+            password = stored_password
+            used_stored_password = True
+
+    if not key_file:
+        stored_key = config_manager.get_credential_value('ssh_key_path')
+        if stored_key:
+            key_file = stored_key
+            used_stored_key = True
+
     credentials_list = []
     
     if try_multiple_credentials:
@@ -536,8 +672,17 @@ def info(ctx, hosts, from_db, username, password, key_file, multiple_usernames, 
             sys.exit(1)
         
         if not password and not key_file:
-            console.print("[red]Error: Must provide either --password or --key-file[/red]")
-            sys.exit(1)
+            password = click.prompt(
+                "Enter SSH password",
+                hide_input=True,
+                show_default=False,
+                default=""
+            )
+            if password:
+                console.print("[yellow]Password captured from prompt[/yellow]")
+            else:
+                console.print("[red]Error: Must provide either --password or --key-file[/red]")
+                sys.exit(1)
     
     # Display configuration
     console.print(f"[green]SSH port:[/green] {port}")
@@ -547,12 +692,15 @@ def info(ctx, hosts, from_db, username, password, key_file, multiple_usernames, 
     if try_multiple_credentials:
         console.print(f"[green]Credentials:[/green] {len(credentials_list)} credential pairs")
     else:
-        console.print(f"[green]Username:[/green] {username}")
+        username_suffix = " [dim](stored)[/dim]" if used_stored_username else ""
+        console.print(f"[green]Username:[/green] {username}{username_suffix}")
         if password:
-            console.print("[yellow]Password:[/yellow] [redacted]")
+            password_suffix = " [dim](stored)[/dim]" if used_stored_password else ""
+            console.print(f"[yellow]Password:[/yellow] [redacted]{password_suffix}")
         if key_file:
-            console.print(f"[yellow]Key file:[/yellow] {key_file}")
-    
+            key_suffix = " [dim](stored)[/dim]" if used_stored_key else ""
+            console.print(f"[yellow]Key file:[/yellow] {key_file}{key_suffix}")
+
     if store_db:
         console.print("[yellow]Will store results in database[/yellow]")
     
@@ -577,6 +725,7 @@ def info(ctx, hosts, from_db, username, password, key_file, multiple_usernames, 
         console.print(f"\n[bold blue]System Information Collection Results:[/bold blue]")
         
         successful_collections = []
+        partial_collections = []
         failed_collections = []
         
         for result in results:
@@ -588,6 +737,15 @@ def info(ctx, hosts, from_db, username, password, key_file, multiple_usernames, 
                     console.print(f"[green]✓ {result['host']} - Complete system info collected using {username_used}[/green]")
                 else:
                     console.print(f"[green]✓ {result['host']} - Complete system info collected[/green]")
+            elif result.get('raw_outputs'):
+                partial_collections.append(result)
+                error_count = len(result['collection_errors'])
+                if try_multiple_credentials:
+                    cred_info = result.get('successful_credential', {})
+                    username_used = cred_info.get('username', 'unknown')
+                    console.print(f"[yellow]⚠ {result['host']} - Partial system info collected using {username_used} ({error_count} issues)[/yellow]")
+                else:
+                    console.print(f"[yellow]⚠ {result['host']} - Partial system info collected ({error_count} issues)[/yellow]")
             else:
                 failed_collections.append(result)
                 error_count = len(result['collection_errors'])
@@ -600,15 +758,21 @@ def info(ctx, hosts, from_db, username, password, key_file, multiple_usernames, 
         # Summary
         console.print(f"\n[bold blue]Collection Summary:[/bold blue]")
         console.print(f"[green]Successful collections:[/green] {len(successful_collections)}")
+        console.print(f"[yellow]Partial collections:[/yellow] {len(partial_collections)}")
         console.print(f"[red]Failed collections:[/red] {len(failed_collections)}")
         success_rate = (len(successful_collections) / len(results)) * 100 if results else 0
+        coverage_rate = ((len(successful_collections) + len(partial_collections)) / len(results) * 100) if results else 0
         console.print(f"[cyan]Success rate:[/cyan] {success_rate:.1f}%")
+        if partial_collections:
+            console.print(f"[cyan]Hosts with usable partial data:[/cyan] {coverage_rate:.1f}%")
+        
+        collections_to_store = [res for res in results if res['collection_success'] or res.get('raw_outputs')]
         
         # Store in database if requested
-        if store_db and successful_collections:
+        if store_db and collections_to_store:
             console.print(f"\n[blue]Storing system information in database...[/blue]")
             
-            for result in successful_collections:
+            for result in collections_to_store:
                 try:
                     parsed = result['parsed_info']
                     
@@ -638,10 +802,20 @@ def info(ctx, hosts, from_db, username, password, key_file, multiple_usernames, 
                     if 'disk' in parsed:
                         import json
                         host_data['disk_usage'] = json.dumps(parsed['disk'])
+
+                    cred_info = result.get('successful_credential', {})
+                    if cred_info:
+                        host_data['working_username'] = cred_info.get('username')
+                        host_data['auth_method'] = cred_info.get('method')
+                    if result.get('auth_attempts') is not None:
+                        host_data['auth_attempts'] = result.get('auth_attempts')
                     
                     # Create or update host in database
                     from .database.operations import db_manager
                     db_manager.create_host(host_data)
+                    
+                    if not result['collection_success']:
+                        console.print(f"[yellow]Stored partial data for {result['host']} (some fields unavailable)[/yellow]")
                     
                 except Exception as e:
                     console.print(f"[red]Error storing info for {result['host']}: {e}[/red]")
@@ -666,9 +840,10 @@ def info(ctx, hosts, from_db, username, password, key_file, multiple_usernames, 
                 console.print(f"[red]Error writing to file: {e}[/red]")
         
         # Display sample system information
-        if successful_collections:
+        sample_source = successful_collections or partial_collections
+        if sample_source:
             console.print(f"\n[bold blue]Sample System Information:[/bold blue]")
-            sample = successful_collections[0]
+            sample = sample_source[0]
             console.print(info_collector.format_system_info(sample))
         
         console.print(f"\n[bold green]System information collection completed![/bold green]")
@@ -1242,6 +1417,8 @@ def config(ctx):
     pass
 
 @config.command()
+@click.argument('key', required=False)
+@click.argument('value', required=False)
 @click.option('--set-username', help='Set default SSH username')
 @click.option('--set-password', help='Set default SSH password')
 @click.option('--set-port', type=int, help='Set default SSH port')
@@ -1249,9 +1426,10 @@ def config(ctx):
 @click.option('--set-timeout', type=int, help='Set default timeout')
 @click.option('--set-auth-timeout', type=int, help='Set SSH authentication timeout')
 @click.option('--set-preferred-auth', type=click.Choice(['key', 'password', 'agent']), help='Set preferred authentication method')
+@click.option('--set-additional-ports', help='Set additional ports to scan (comma-separated list)')
 @click.option('--set-log-level', type=click.Choice(['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']), help='Set logging level')
 @click.pass_context
-def set(ctx, set_username, set_password, set_port, set_threads, set_timeout, set_auth_timeout, set_preferred_auth, set_log_level):
+def set(ctx, key, value, set_username, set_password, set_port, set_threads, set_timeout, set_auth_timeout, set_preferred_auth, set_additional_ports, set_log_level):
     """Set configuration values"""
     
     console.print(Panel.fit(
@@ -1263,6 +1441,66 @@ def set(ctx, set_username, set_password, set_port, set_threads, set_timeout, set
     
     try:
         changes_made = False
+        key = key.strip() if key else None
+        value = value.strip() if isinstance(value, str) else value
+
+        def resolve_alias(config_key: str) -> str:
+            aliases = {
+                'scanning.threads': 'scanning.default_threads',
+                'scanning.timeout': 'scanning.default_timeout',
+                'scanning.port': 'scanning.default_port',
+                'scanning.retries': 'scanning.max_retries',
+                'scanning.additional': 'scanning.additional_ports',
+                'scanning.extra_ports': 'scanning.additional_ports'
+            }
+            return aliases.get(config_key.lower(), config_key)
+
+        def coerce(raw_value: str, current_value=None):
+            if raw_value is None:
+                return None
+            text = raw_value.strip()
+            if current_value is not None:
+                if isinstance(current_value, bool):
+                    return text.lower() in ('1', 'true', 'yes', 'on')
+                if isinstance(current_value, int):
+                    try:
+                        return int(text)
+                    except ValueError:
+                        pass
+                if isinstance(current_value, float):
+                    try:
+                        return float(text)
+                    except ValueError:
+                        pass
+            lowered = text.lower()
+            if lowered in ('true', 'false'):
+                return lowered == 'true'
+            try:
+                return int(text)
+            except ValueError:
+                try:
+                    return float(text)
+                except ValueError:
+                    return text
+
+        # Handle direct key/value updates (dot notation)
+        if key:
+            if value is None:
+                console.print(f"[red]Error: Missing value for configuration key '{key}'[/red]")
+                sys.exit(1)
+
+            normalized_key = resolve_alias(key)
+            current_value = config_manager.get_value(normalized_key)
+            new_value = coerce(value, current_value)
+
+            if '.' not in normalized_key:
+                console.print(f"[red]Error: Configuration key '{normalized_key}' must use section.key format[/red]")
+                sys.exit(1)
+
+            section, cfg_key = normalized_key.split('.', 1)
+            config_manager.set(section, cfg_key, new_value)
+            console.print(f"[green]✓ {normalized_key} set:[/green] {new_value}")
+            changes_made = True
         
         # Handle credentials separately
         if set_username:
@@ -1316,6 +1554,14 @@ def set(ctx, set_username, set_password, set_port, set_threads, set_timeout, set
             config_manager.set('ssh', 'preferred_auth', set_preferred_auth)
             console.print(f"[green]✓ Preferred authentication method set:[/green] {set_preferred_auth}")
             changes_made = True
+
+        if set_additional_ports is not None:
+            ports = config_manager.set_additional_ports(set_additional_ports)
+            if ports:
+                console.print(f"[green]✓ Additional ports set:[/green] {', '.join(str(p) for p in ports)}")
+            else:
+                console.print("[yellow]Additional ports cleared[/yellow]")
+            changes_made = True
         
         if set_log_level:
             config_manager.set('logging', 'level', set_log_level)
@@ -1334,6 +1580,64 @@ def set(ctx, set_username, set_password, set_port, set_threads, set_timeout, set
     
     except Exception as e:
         console.print(f"[red]Error updating configuration: {e}[/red]")
+        if ctx.obj.get('debug'):
+            import traceback
+            traceback.print_exc()
+        sys.exit(1)
+
+@config.command(name='set-credential')
+@click.argument('credential_type')
+@click.argument('value', required=False)
+@click.option('--no-encrypt', is_flag=True, help='Store credential without encoding')
+@click.pass_context
+def set_credential_command(ctx, credential_type, value, no_encrypt):
+    """Store a credential such as username or password"""
+
+    console.print(Panel.fit(
+        Text("NetScan - Credential Setup", style="bold cyan"),
+        border_style="cyan"
+    ))
+
+    from .config import config_manager
+
+    try:
+        cred_key = credential_type.strip().lower()
+        if not cred_key:
+            console.print("[red]Error: Credential type is required[/red]")
+            sys.exit(1)
+
+        provided_value = value
+        if provided_value is None:
+            prompt_label = cred_key.replace('_', ' ')
+            if cred_key in ('password', 'passphrase'):
+                provided_value = click.prompt(
+                    f"Enter {prompt_label}",
+                    hide_input=True,
+                    confirmation_prompt=True,
+                    show_default=False
+                )
+            else:
+                provided_value = click.prompt(
+                    f"Enter {prompt_label}",
+                    show_default=False
+                )
+
+        if not provided_value:
+            console.print("[yellow]No credential provided. Nothing changed.[/yellow]")
+            return
+
+        if config_manager.set_credential(cred_key, provided_value, encrypt=not no_encrypt):
+            suffix = " (stored without encoding)" if no_encrypt else ""
+            label = cred_key.replace('_', ' ').title()
+            display_value = provided_value if cred_key != 'password' else '[redacted]'
+            console.print(f"[green]✓ {label} stored:[/green] {display_value}{suffix}")
+        else:
+            console.print(f"[red]Error storing credential '{cred_key}'[/red]")
+
+    except click.Abort:
+        console.print("\n[yellow]Credential entry cancelled[/yellow]")
+    except Exception as e:
+        console.print(f"[red]Error storing credential: {e}[/red]")
         if ctx.obj.get('debug'):
             import traceback
             traceback.print_exc()

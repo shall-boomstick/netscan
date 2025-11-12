@@ -73,6 +73,26 @@ class DatabaseManager:
                 try:
                     db_logger.log_transaction_start("create_host")
                     start_time = datetime.now()
+                    ip_address = host_data.get('ip_address')
+                    
+                    if not ip_address:
+                        raise DatabaseError("Host data must include 'ip_address'")
+                    
+                    existing_host = session.query(Host).filter(Host.ip_address == ip_address).first()
+                    
+                    if existing_host:
+                        for key, value in host_data.items():
+                            if hasattr(existing_host, key) and value is not None:
+                                setattr(existing_host, key, value)
+                        existing_host.last_scan = datetime.utcnow()
+                        session.commit()
+                        session.refresh(existing_host)
+                        
+                        duration = (datetime.now() - start_time).total_seconds()
+                        db_logger.log_transaction_commit("create_host(update)", duration)
+                        logger.debug(f"Updated existing host: {existing_host.ip_address}")
+                        
+                        return existing_host
                     
                     host = Host(**host_data)
                     session.add(host)

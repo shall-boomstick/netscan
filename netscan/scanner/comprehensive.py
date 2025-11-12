@@ -5,6 +5,7 @@ This module provides a complete scanning workflow that combines network discover
 SSH authentication testing, and system information collection in a single operation.
 """
 
+import json
 from typing import List, Dict, Any, Optional
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeRemainingColumn
@@ -16,6 +17,7 @@ from .network import NetworkScanner
 from .ssh import SSHConnector
 from .collector import SystemInfoCollector
 from ..utils.logging import get_logger
+from ..config import config_manager
 
 console = Console()
 logger = get_logger("scanner.comprehensive")
@@ -29,7 +31,12 @@ class ComprehensiveScanner:
         self.threads = threads
         
         # Initialize component scanners
-        self.network_scanner = NetworkScanner(timeout=timeout, threads=threads)
+        additional_ports = config_manager.get_additional_ports()
+        self.network_scanner = NetworkScanner(
+            timeout=timeout,
+            threads=threads,
+            additional_ports=additional_ports
+        )
         self.ssh_connector = SSHConnector(timeout=timeout)
         self.info_collector = SystemInfoCollector(self.ssh_connector)
     
@@ -94,7 +101,12 @@ class ComprehensiveScanner:
         console.print(f"\n[bold blue]Phase 1: Network Discovery[/bold blue]")
         console.print(f"Scanning range: {ip_range}")
         console.print(f"Target port: {port}")
+        extra_ports = [p for p in self.network_scanner.additional_ports if p != port]
+        if extra_ports:
+            console.print(f"Additional ports: {', '.join(str(p) for p in extra_ports)}")
         
+        discovered_hosts = []
+        discovered_lookup = {}
         try:
             if use_nmap:
                 # Use nmap for faster discovery
@@ -142,6 +154,7 @@ class ComprehensiveScanner:
             results['network_discovery']['total_hosts_scanned'] = len(host_list) if not use_nmap else 0
             results['network_discovery']['ssh_hosts_found'] = len(discovered_hosts)
             results['network_discovery']['discovered_hosts'] = discovered_hosts
+            discovered_lookup = {host['ip_address']: host for host in discovered_hosts}
             
             console.print(f"\n[green]Discovery complete: {len(discovered_hosts)} SSH hosts found[/green]")
             
@@ -347,6 +360,8 @@ class ComprehensiveScanner:
                             'auth_method': cred_info.get('method'),
                             'auth_attempts': result.get('auth_attempts', 0)
                         }
+                        discovered_entry = discovered_lookup.get(result['host'], {})
+                        host_data['open_ports'] = json.dumps(discovered_entry.get('open_ports', []))
                         
                         # Add system info if available
                         if 'memory' in parsed:
