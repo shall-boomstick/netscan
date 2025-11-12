@@ -23,7 +23,7 @@ logger = get_logger()
 class SSHConnector:
     """SSH connection handler class"""
     
-    def __init__(self, timeout: int = 10, max_retries: int = 3):
+    def __init__(self, timeout: int = 5, max_retries: int = 3):
         self.timeout = timeout
         self.max_retries = max_retries
         self.connection_pool = {}
@@ -300,6 +300,169 @@ class SSHConnector:
             result['error'] = "No authentication methods available"
         
         return result
+    
+    def try_multiple_credentials(self, host: str, port: int = 22, 
+                                credentials: List[Dict[str, str]] = None) -> Dict[str, Any]:
+        """Try multiple username/password combinations for SSH connection"""
+        
+        result = {
+            'host': host,
+            'port': port,
+            'connected': False,
+            'auth_method': None,
+            'successful_credential': None,
+            'error': None,
+            'attempts': []
+        }
+        
+        if not credentials:
+            result['error'] = "No credentials provided"
+            return result
+        
+        # Try each credential pair
+        for i, cred in enumerate(credentials):
+            username = cred.get('username')
+            password = cred.get('password')
+            key_file = cred.get('key_file')
+            
+            if not username:
+                console.print(f"[yellow]Skipping credential {i+1} - no username[/yellow]")
+                continue
+            
+            console.print(f"[yellow]Trying credential {i+1}: {username}@{host}...[/yellow]")
+            
+            # Try password authentication
+            if password:
+                auth_result = self.test_connection(host, port, username, password)
+                result['attempts'].append({
+                    'credential_index': i,
+                    'username': username,
+                    'method': 'password',
+                    'success': auth_result['connected'],
+                    'error': auth_result.get('error')
+                })
+                
+                if auth_result['connected']:
+                    result['connected'] = True
+                    result['auth_method'] = 'password'
+                    result['successful_credential'] = {'username': username, 'method': 'password'}
+                    result['server_info'] = auth_result.get('server_info')
+                    result['connection_time'] = auth_result.get('connection_time')
+                    console.print(f"[green]✓ Authentication successful: {username}@{host} (password)[/green]")
+                    return result
+            
+            # Try key authentication
+            if key_file:
+                auth_result = self.test_connection(host, port, username, key_file=key_file)
+                result['attempts'].append({
+                    'credential_index': i,
+                    'username': username,
+                    'method': f'key:{key_file}',
+                    'success': auth_result['connected'],
+                    'error': auth_result.get('error')
+                })
+                
+                if auth_result['connected']:
+                    result['connected'] = True
+                    result['auth_method'] = f'key:{key_file}'
+                    result['successful_credential'] = {'username': username, 'method': f'key:{key_file}'}
+                    result['server_info'] = auth_result.get('server_info')
+                    result['connection_time'] = auth_result.get('connection_time')
+                    console.print(f"[green]✓ Authentication successful: {username}@{host} (key)[/green]")
+                    return result
+            
+            # If neither password nor key_file provided, try SSH key discovery
+            if not password and not key_file:
+                ssh_keys = self.find_ssh_keys()
+                for key_file_path in ssh_keys:
+                    console.print(f"[yellow]Trying {username}@{host} with key {key_file_path}...[/yellow]")
+                    auth_result = self.test_connection(host, port, username, key_file=key_file_path)
+                    result['attempts'].append({
+                        'credential_index': i,
+                        'username': username,
+                        'method': f'key:{key_file_path}',
+                        'success': auth_result['connected'],
+                        'error': auth_result.get('error')
+                    })
+                    
+                    if auth_result['connected']:
+                        result['connected'] = True
+                        result['auth_method'] = f'key:{key_file_path}'
+                        result['successful_credential'] = {'username': username, 'method': f'key:{key_file_path}'}
+                        result['server_info'] = auth_result.get('server_info')
+                        result['connection_time'] = auth_result.get('connection_time')
+                        console.print(f"[green]✓ Authentication successful: {username}@{host} (key)[/green]")
+                        return result
+        
+        # If no credential worked, set error
+        if result['attempts']:
+            result['error'] = f"All credentials failed ({len(result['attempts'])} attempts)"
+        else:
+            result['error'] = "No valid credentials provided"
+        
+        return result
+    
+    def concurrent_test_multiple_credentials(self, hosts: List[str], port: int = 22, 
+                                           credentials: List[Dict[str, str]] = None, 
+                                           max_workers: int = 10) -> List[Dict[str, Any]]:
+        """Test multiple credentials on multiple hosts concurrently"""
+        
+        results = []
+        
+        if not credentials:
+            # Return empty results if no credentials provided
+            return [{'host': host, 'connected': False, 'error': 'No credentials provided'} for host in hosts]
+        
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeRemainingColumn(),
+            console=console,
+            transient=True
+        ) as progress:
+            
+            task = progress.add_task(f"Testing credentials on {len(hosts)} hosts", total=len(hosts))
+            
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # Submit all tasks
+                future_to_host = {
+                    executor.submit(self.try_multiple_credentials, host, port, credentials): host
+                    for host in hosts
+                }
+                
+                # Process completed tasks
+                for future in as_completed(future_to_host):
+                    host = future_to_host[future]
+                    try:
+                        result = future.result()
+                        results.append(result)
+                        
+                        # Update progress
+                        progress.update(task, advance=1)
+                        
+                        # Show results
+                        if result['connected']:
+                            cred_info = result.get('successful_credential', {})
+                            username = cred_info.get('username', 'unknown')
+                            method = cred_info.get('method', 'unknown')
+                            console.print(f"[green]✓ SSH connected: {username}@{result['host']}:{result['port']} ({method})[/green]")
+                        else:
+                            attempt_count = len(result.get('attempts', []))
+                            console.print(f"[red]✗ SSH failed: {result['host']}:{result['port']} - {result['error']} ({attempt_count} attempts)[/red]")
+                            
+                    except Exception as e:
+                        console.print(f"[red]Error testing {host}: {e}[/red]")
+                        results.append({
+                            'host': host,
+                            'connected': False,
+                            'error': f"Unexpected error: {str(e)}",
+                            'attempts': []
+                        })
+                        progress.update(task, advance=1)
+        
+        return results
     
     def get_connection_summary(self, results: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Get summary statistics from SSH connection results"""

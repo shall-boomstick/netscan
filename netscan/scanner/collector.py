@@ -334,6 +334,99 @@ class SystemInfoCollector:
         
         return results
     
+    def collect_from_multiple_hosts_with_credentials(self, hosts: List[str], port: int = 22, 
+                                                   credentials: List[Dict[str, str]] = None) -> List[Dict[str, Any]]:
+        """Collect system information from multiple hosts using multiple credentials"""
+        
+        results = []
+        
+        if not credentials:
+            return [{'host': host, 'collection_success': False, 'collection_errors': ['No credentials provided']} for host in hosts]
+        
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            console=console,
+            transient=True
+        ) as progress:
+            
+            task = progress.add_task(f"Collecting system info from {len(hosts)} hosts", total=len(hosts))
+            
+            for host in hosts:
+                try:
+                    # Try to find working credentials for this host
+                    working_creds = None
+                    auth_result = self.ssh_connector.try_multiple_credentials(host, port, credentials)
+                    
+                    if auth_result['connected']:
+                        # Extract working credentials
+                        successful_cred = auth_result.get('successful_credential', {})
+                        working_creds = {
+                            'username': successful_cred.get('username'),
+                            'password': None,
+                            'key_file': None
+                        }
+                        
+                        # Determine authentication method
+                        method = successful_cred.get('method', '')
+                        if method == 'password':
+                            # Find the password from the credentials list
+                            for cred in credentials:
+                                if cred.get('username') == working_creds['username'] and cred.get('password'):
+                                    working_creds['password'] = cred['password']
+                                    break
+                        elif method.startswith('key:'):
+                            working_creds['key_file'] = method.split(':', 1)[1]
+                        
+                        # Collect system information using working credentials
+                        info = self.collect_system_info(
+                            host, port, 
+                            working_creds['username'], 
+                            working_creds['password'], 
+                            working_creds['key_file']
+                        )
+                        
+                        # Add authentication info to results
+                        info['successful_credential'] = successful_cred
+                        info['auth_attempts'] = len(auth_result.get('attempts', []))
+                        
+                        results.append(info)
+                        
+                        if info['collection_success']:
+                            console.print(f"[green]✓ System info collected from {host} using {working_creds['username']}[/green]")
+                        else:
+                            console.print(f"[yellow]⚠ Partial info collected from {host} ({len(info['collection_errors'])} errors)[/yellow]")
+                    else:
+                        # No working credentials found
+                        error_info = {
+                            'host': host,
+                            'collection_success': False,
+                            'collection_errors': [f"Authentication failed: {auth_result['error']}"],
+                            'raw_outputs': {},
+                            'parsed_info': {},
+                            'auth_attempts': len(auth_result.get('attempts', []))
+                        }
+                        results.append(error_info)
+                        console.print(f"[red]✗ Failed to authenticate to {host} with any credentials[/red]")
+                    
+                    progress.update(task, advance=1)
+                    
+                except Exception as e:
+                    error_info = {
+                        'host': host,
+                        'collection_success': False,
+                        'collection_errors': [f"Failed to collect info: {str(e)}"],
+                        'raw_outputs': {},
+                        'parsed_info': {},
+                        'auth_attempts': 0
+                    }
+                    results.append(error_info)
+                    console.print(f"[red]✗ Failed to collect info from {host}: {e}[/red]")
+                    progress.update(task, advance=1)
+        
+        return results
+    
     def format_system_info(self, info: Dict[str, Any]) -> str:
         """Format system information for display"""
         if not info['collection_success'] and not info['parsed_info']:

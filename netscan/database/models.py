@@ -9,6 +9,8 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 from datetime import datetime
 
+import json
+
 Base = declarative_base()
 
 
@@ -29,6 +31,13 @@ class Host(Base):
     memory_total = Column(Integer)  # in MB
     memory_used = Column(Integer)   # in MB
     disk_usage = Column(Text)       # JSON string for disk usage info
+    open_ports = Column(Text)       # JSON string for additional open ports
+    
+    # Authentication information
+    working_username = Column(String(100))  # Username that successfully authenticated
+    auth_method = Column(String(50))        # Authentication method used (password, key, etc.)
+    auth_attempts = Column(Integer)         # Number of authentication attempts
+    
     last_scan = Column(DateTime, default=datetime.utcnow, index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     
@@ -50,6 +59,7 @@ class Host(Base):
             'ip_address': self.ip_address,
             'hostname': self.hostname,
             'ssh_port': self.ssh_port,
+            'open_ports': self._deserialize_json(self.open_ports),
             'status': self.status,
             'os_info': self.os_info,
             'kernel_version': self.kernel_version,
@@ -58,9 +68,21 @@ class Host(Base):
             'memory_total': self.memory_total,
             'memory_used': self.memory_used,
             'disk_usage': self.disk_usage,
+            'working_username': self.working_username,
+            'auth_method': self.auth_method,
+            'auth_attempts': self.auth_attempts,
             'last_scan': self.last_scan.isoformat() if self.last_scan else None,
             'created_at': self.created_at.isoformat() if self.created_at else None,
         }
+    
+    @staticmethod
+    def _deserialize_json(value):
+        if not value:
+            return []
+        try:
+            return json.loads(value)
+        except (ValueError, TypeError):
+            return value
 
 
 class ScanHistory(Base):

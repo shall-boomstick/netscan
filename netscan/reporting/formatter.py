@@ -34,8 +34,10 @@ class ReportFormatter:
         table.add_column("IP Address", style="cyan", no_wrap=True)
         table.add_column("Hostname", style="green")
         table.add_column("SSH Port", justify="right", style="yellow")
+        table.add_column("Extra Ports", style="yellow")
         table.add_column("Status", style="bold")
         table.add_column("OS Info", style="blue")
+        table.add_column("CPU Info", style="yellow")
         table.add_column("Uptime", style="magenta")
         table.add_column("Memory", justify="right", style="cyan")
         table.add_column("Last Scan", style="dim")
@@ -61,12 +63,22 @@ class ReportFormatter:
             if host.last_scan:
                 last_scan_str = host.last_scan.strftime("%Y-%m-%d %H:%M")
             
+            # CPU info formatting
+            cpu_str = "Unknown"
+            if host.cpu_info:
+                # Truncate long CPU model names for display
+                cpu_str = host.cpu_info[:30] + "..." if len(host.cpu_info) > 30 else host.cpu_info
+            
+            extra_ports_display = self._format_open_ports(host)
+            
             table.add_row(
                 host.ip_address,
                 host.hostname or "Unknown",
                 str(host.ssh_port),
+                extra_ports_display,
                 status,
                 host.os_info or "Unknown",
+                cpu_str,
                 host.uptime or "Unknown",
                 memory_str,
                 last_scan_str
@@ -93,11 +105,12 @@ class ReportFormatter:
         writer.writerow([
             'IP Address', 'Hostname', 'SSH Port', 'Status', 'OS Info',
             'Kernel Version', 'Uptime', 'CPU Info', 'Memory Total (MB)',
-            'Memory Used (MB)', 'Disk Usage', 'Last Scan', 'Created At'
+            'Memory Used (MB)', 'Disk Usage', 'Open Ports', 'Last Scan', 'Created At'
         ])
         
         # Write data
         for host in hosts:
+            extra_ports_display = self._format_open_ports(host, plain_text=True)
             writer.writerow([
                 host.ip_address,
                 host.hostname or '',
@@ -110,6 +123,7 @@ class ReportFormatter:
                 host.memory_total or '',
                 host.memory_used or '',
                 host.disk_usage or '',
+                extra_ports_display,
                 host.last_scan.isoformat() if host.last_scan else '',
                 host.created_at.isoformat() if host.created_at else ''
             ])
@@ -136,6 +150,9 @@ class ReportFormatter:
             output.append(f"  Uptime: {host.uptime or 'Unknown'}")
             output.append(f"  CPU: {host.cpu_info or 'Unknown'}")
             
+            extra_ports_display = self._format_open_ports(host, plain_text=True)
+            output.append(f"  Extra Ports: {extra_ports_display or 'None'}")
+            
             if host.memory_total and host.memory_used:
                 usage_pct = (host.memory_used / host.memory_total) * 100
                 output.append(f"  Memory: {host.memory_used}MB/{host.memory_total}MB ({usage_pct:.1f}%)")
@@ -146,6 +163,61 @@ class ReportFormatter:
             output.append("")
         
         return "\n".join(output)
+    
+    @staticmethod
+    def _parse_host_open_ports(host: Host) -> List[Dict[str, Any]]:
+        raw_value = getattr(host, 'open_ports', None)
+        if not raw_value:
+            return []
+        if isinstance(raw_value, str):
+            try:
+                data = json.loads(raw_value)
+            except (ValueError, TypeError):
+                return []
+        elif isinstance(raw_value, list):
+            data = raw_value
+        else:
+            return []
+        
+        normalized = []
+        for entry in data:
+            if isinstance(entry, dict):
+                port = entry.get('port')
+                service = entry.get('service')
+            elif isinstance(entry, (list, tuple)) and entry:
+                port = entry[0]
+                service = entry[1] if len(entry) > 1 else None
+            else:
+                try:
+                    port = int(entry)
+                    service = None
+                except (TypeError, ValueError):
+                    continue
+            if port is None:
+                continue
+            try:
+                port_int = int(port)
+            except (TypeError, ValueError):
+                continue
+            normalized.append({
+                'port': port_int,
+                'service': service
+            })
+        return normalized
+    
+    def _format_open_ports(self, host: Host, plain_text: bool = False) -> str:
+        ports = self._parse_host_open_ports(host)
+        if not ports:
+            return "" if plain_text else "—"
+        pieces = []
+        for entry in sorted(ports, key=lambda item: item['port']):
+            label = str(entry['port'])
+            service = entry.get('service')
+            if service:
+                label = f"{label} ({service})"
+            pieces.append(label)
+        separator = ", "
+        return separator.join(pieces)
     
     def format_scan_history_table(self, scan_history: List[ScanHistory], title: str = "Scan History") -> Table:
         """Format scan history as a Rich table"""

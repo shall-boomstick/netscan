@@ -4,3 +4,5 @@ paramiko>=3.0.0
 python-nmap>=0.7.1
 python-dotenv>=1.0.0
 sqlalchemy>=2.0.0 
+questionary>=1.10.0 
+textual>=0.54.0 

@@ -28,13 +28,14 @@ class ConfigManager:
         self.defaults = {
             'scanning': {
                 'default_port': 22,
-                'default_timeout': 5,
+                'default_timeout': 3,
                 'default_threads': 10,
                 'use_nmap': True,
-                'max_retries': 0
+                'max_retries': 0,
+                'additional_ports': ''
             },
             'ssh': {
-                'auth_timeout': 10,
+                'auth_timeout': 5,
                 'key_discovery': True,
                 'preferred_auth': 'key',  # 'key', 'password', 'agent'
                 'connection_pool_size': 20
@@ -121,6 +122,7 @@ class ConfigManager:
             'NETSCAN_DB_PATH': ('database', 'path', str),
             'NETSCAN_LOG_LEVEL': ('logging', 'level', str),
             'NETSCAN_LOG_FILE': ('logging', 'file_path', str),
+            'NETSCAN_ADDITIONAL_PORTS': ('scanning', 'additional_ports', str),
         }
         
         for env_var, (section, key, type_func) in env_mapping.items():
@@ -209,6 +211,46 @@ class ConfigManager:
         """Get entire configuration section"""
         return self.config.get(section, {}).copy()
     
+    def _parse_ports_value(self, value: Any) -> list:
+        """Normalize incoming port configuration to a list of ints"""
+        if value is None:
+            return []
+        
+        ports = []
+        
+        if isinstance(value, str):
+            candidates = [item.strip() for item in value.replace(';', ',').split(',')]
+        elif isinstance(value, (list, tuple, set)):
+            candidates = list(value)
+        else:
+            candidates = [value]
+        
+        for item in candidates:
+            if item in (None, ''):
+                continue
+            try:
+                port = int(item)
+                if port not in ports:
+                    ports.append(port)
+            except (TypeError, ValueError):
+                logger.warning(f"Ignoring invalid port value: {item}")
+        
+        return ports
+    
+    def get_additional_ports(self) -> list:
+        """Return configured additional ports as a list of integers"""
+        raw_value = self.get('scanning', 'additional_ports', '')
+        ports = self._parse_ports_value(raw_value)
+        return [p for p in ports if 1 <= p <= 65535]
+    
+    def set_additional_ports(self, ports: Any, save_to_db: bool = True) -> list:
+        """Set additional ports configuration"""
+        normalized_ports = self._parse_ports_value(ports)
+        normalized_ports = [p for p in normalized_ports if 1 <= p <= 65535]
+        value = ','.join(str(p) for p in normalized_ports)
+        self.set('scanning', 'additional_ports', value, save_to_db)
+        return normalized_ports
+    
     def set_value(self, key: str, value: Any, save_to_db: bool = True):
         """Set configuration value using dot notation (section.key)"""
         if '.' in key:
@@ -245,6 +287,11 @@ class ConfigManager:
 
         if not (0 <= scanning.get('max_retries', 0) <= 10):
             scanning_errors.append("max_retries must be between 0 and 10")
+
+        additional_ports = self.get_additional_ports()
+        invalid_ports = [p for p in additional_ports if p < 1 or p > 65535]
+        if invalid_ports:
+            scanning_errors.append(f"additional_ports contains invalid values: {invalid_ports}")
         
         if scanning_errors:
             errors['scanning'] = scanning_errors

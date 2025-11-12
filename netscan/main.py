@@ -5,6 +5,7 @@ Main CLI entry point using Click
 """
 
 import click
+import json
 from rich.console import Console
 from rich.text import Text
 from rich.panel import Panel
@@ -15,6 +16,7 @@ from datetime import datetime
 from .scanner.network import NetworkScanner
 from .scanner.ssh import SSHConnector
 from .scanner.collector import SystemInfoCollector
+from .scanner.comprehensive import ComprehensiveScanner
 from .utils.validators import validate_ip_range, validate_port, validate_username, validate_timeout, validate_threads
 
 # Initialize Rich console
@@ -88,6 +90,8 @@ def network(ctx, range, username, password, port, threads, timeout, retries, no_
             password = stored_password
             used_stored_password = True
     
+    additional_ports = config_manager.get_additional_ports()
+    
     # Validate inputs
     if not validate_ip_range(range):
         console.print(f"[red]Error: Invalid IP range: {range}[/red]")
@@ -136,7 +140,12 @@ def network(ctx, range, username, password, port, threads, timeout, retries, no_
     
     try:
         # Initialize scanner
-        scanner = NetworkScanner(timeout=timeout, threads=threads, max_retries=retries)
+        scanner = NetworkScanner(
+            timeout=timeout,
+            threads=threads,
+            max_retries=retries,
+            additional_ports=additional_ports,
+        )
         
         # Perform network scan
         results = scanner.scan_range(range, port=port, use_nmap=not no_nmap)
@@ -157,6 +166,40 @@ def network(ctx, range, username, password, port, threads, timeout, retries, no_
         console.print(f"[red]Timeout hosts:[/red] {summary['timeout_hosts']}")
         console.print(f"[cyan]Success rate:[/cyan] {summary['success_rate']:.1f}%")
         
+        if additional_ports:
+            from rich.table import Table
+            
+            extra_port_counts = {}
+            host_port_rows = []
+            for host_result in results:
+                extra_open = [
+                    str(port_info['port'])
+                    for port_info in host_result.get('open_ports', [])
+                    if port_info['port'] != port
+                ]
+                for port_num in extra_open:
+                    extra_port_counts[port_num] = extra_port_counts.get(port_num, 0) + 1
+                if extra_open:
+                    host_port_rows.append((host_result['ip_address'], ", ".join(sorted(extra_open))))
+            
+            console.print("\n[bold blue]Additional Port Findings[/bold blue]")
+            if extra_port_counts:
+                summary_table = Table(show_header=True, header_style="bold magenta")
+                summary_table.add_column("Port", justify="right")
+                summary_table.add_column("Open Hosts", justify="right")
+                for port_num, count in sorted(extra_port_counts.items(), key=lambda item: int(item[0])):
+                    summary_table.add_row(str(port_num), str(count))
+                console.print(summary_table)
+                
+                host_table = Table(show_header=True, header_style="bold cyan")
+                host_table.add_column("Host")
+                host_table.add_column("Open Additional Ports")
+                for ip_address, ports_str in sorted(host_port_rows):
+                    host_table.add_row(ip_address, ports_str)
+                console.print(host_table)
+            else:
+                console.print("[cyan]No additional ports were detected as open.[/cyan]")
+        
         # Store results in database
         active_hosts = [r for r in results if r['status'] == 'active']
         if active_hosts:
@@ -166,11 +209,13 @@ def network(ctx, range, username, password, port, threads, timeout, retries, no_
             
             for host_result in active_hosts:
                 # Prepare host data for database
+                open_ports_payload = host_result.get('open_ports', [])
                 host_data = {
                     'ip_address': host_result['ip_address'],
                     'hostname': host_result.get('hostname'),
                     'ssh_port': host_result['ssh_port'],
-                    'status': 'active'
+                    'status': 'active',
+                    'open_ports': json.dumps(open_ports_payload)
                 }
                 
                 # Create or update host in database
@@ -196,15 +241,19 @@ def network(ctx, range, username, password, port, threads, timeout, retries, no_
 @scan.command()
 @click.option('--hosts', '-h', help='Comma-separated list of IP addresses/hostnames')
 @click.option('--from-db', is_flag=True, help='Use hosts from database')
-@click.option('--username', '-u', required=True, help='SSH username')
-@click.option('--password', '-p', help='SSH password', prompt=True, hide_input=True, prompt_required=False)
+@click.option('--username', '-u', help='SSH username (falls back to stored credential)')
+@click.option('--password', '-p', help='SSH password (falls back to stored credential)')
 @click.option('--key-file', '-k', help='SSH private key file path')
+@click.option('--multiple-usernames', help='Comma-separated list of usernames to try')
+@click.option('--multiple-passwords', help='Comma-separated list of passwords to try')
+@click.option('--credentials-file', help='File containing username:password pairs (one per line)')
+@click.option('--try-multiple-credentials', is_flag=True, help='Try multiple username/password combinations')
 @click.option('--port', '-P', default=22, help='SSH port (default: 22)')
-@click.option('--timeout', '-T', default=10, help='Connection timeout in seconds (default: 10)')
+@click.option('--timeout', '-T', default=5, help='Connection timeout in seconds (default: 5)')
 @click.option('--threads', '-t', default=5, help='Number of concurrent threads (default: 5)')
 @click.option('--try-all-methods', is_flag=True, help='Try all available authentication methods')
 @click.pass_context
-def auth(ctx, hosts, from_db, username, password, key_file, port, timeout, threads, try_all_methods):
+def auth(ctx, hosts, from_db, username, password, key_file, multiple_usernames, multiple_passwords, credentials_file, try_multiple_credentials, port, timeout, threads, try_all_methods):
     """Test SSH authentication to discovered hosts"""
     
     console.print(Panel.fit(
@@ -213,10 +262,6 @@ def auth(ctx, hosts, from_db, username, password, key_file, port, timeout, threa
     ))
     
     # Validate inputs
-    if not validate_username(username):
-        console.print(f"[red]Error: Invalid username format: {username}[/red]")
-        sys.exit(1)
-    
     if not validate_port(port):
         console.print(f"[red]Error: Invalid port number: {port}[/red]")
         sys.exit(1)
@@ -227,6 +272,11 @@ def auth(ctx, hosts, from_db, username, password, key_file, port, timeout, threa
     
     if not validate_threads(threads):
         console.print(f"[red]Error: Invalid thread count: {threads}[/red]")
+        sys.exit(1)
+    
+    # Validate username for single credential mode
+    if username and not validate_username(username):
+        console.print(f"[red]Error: Invalid username format: {username}[/red]")
         sys.exit(1)
     
     # Get host list
@@ -256,39 +306,133 @@ def auth(ctx, hosts, from_db, username, password, key_file, port, timeout, threa
         return
     
     from .config import config_manager
+    used_stored_username = False
     used_stored_password = False
     used_stored_key = False
-
+    
+    if not username:
+        stored_username = config_manager.get_credential_value('username')
+        if stored_username:
+            username = stored_username
+            used_stored_username = True
+    
     if not password:
         stored_password = config_manager.get_credential_value('password')
         if stored_password:
             password = stored_password
             used_stored_password = True
-
+    
     if not key_file:
         stored_key = config_manager.get_credential_value('ssh_key_path')
         if stored_key:
             key_file = stored_key
             used_stored_key = True
     
-    # Check authentication parameters
-    if not password and not key_file and not try_all_methods:
-        console.print("[red]Error: Must provide --password, --key-file, or --try-all-methods[/red]")
-        sys.exit(1)
+    # Prepare credential list holder for multi-credential mode
+    credentials_list = []
     
-    console.print(f"[green]Username:[/green] {username}")
+    if try_multiple_credentials:
+        # Parse multiple credentials
+        if credentials_file:
+            console.print(f"[blue]Loading credentials from file: {credentials_file}[/blue]")
+            try:
+                with open(credentials_file, 'r') as f:
+                    for line_num, line in enumerate(f, 1):
+                        line = line.strip()
+                        if line and not line.startswith('#'):
+                            if ':' in line:
+                                cred_username, cred_password = line.split(':', 1)
+                                credentials_list.append({
+                                    'username': cred_username.strip(),
+                                    'password': cred_password.strip()
+                                })
+                            else:
+                                console.print(f"[yellow]Warning: Invalid credential format on line {line_num}: {line}[/yellow]")
+                console.print(f"[green]Loaded {len(credentials_list)} credentials from file[/green]")
+            except FileNotFoundError:
+                console.print(f"[red]Error: Credentials file not found: {credentials_file}[/red]")
+                sys.exit(1)
+            except Exception as e:
+                console.print(f"[red]Error reading credentials file: {e}[/red]")
+                sys.exit(1)
+        
+        elif multiple_usernames and multiple_passwords:
+            # Parse multiple usernames and passwords
+            usernames = [u.strip() for u in multiple_usernames.split(',')]
+            passwords = [p.strip() for p in multiple_passwords.split(',')]
+            
+            if len(usernames) != len(passwords):
+                console.print("[red]Error: Number of usernames must match number of passwords[/red]")
+                sys.exit(1)
+            
+            for u, p in zip(usernames, passwords):
+                if not validate_username(u):
+                    console.print(f"[red]Error: Invalid username format: {u}[/red]")
+                    sys.exit(1)
+                credentials_list.append({'username': u, 'password': p})
+            
+            console.print(f"[green]Using {len(credentials_list)} username/password pairs[/green]")
+        
+        elif multiple_usernames:
+            # Multiple usernames with single password or key
+            usernames = [u.strip() for u in multiple_usernames.split(',')]
+            
+            for u in usernames:
+                if not validate_username(u):
+                    console.print(f"[red]Error: Invalid username format: {u}[/red]")
+                    sys.exit(1)
+                
+                cred = {'username': u}
+                if password:
+                    cred['password'] = password
+                if key_file:
+                    cred['key_file'] = key_file
+                credentials_list.append(cred)
+            
+            console.print(f"[green]Using {len(credentials_list)} usernames[/green]")
+        
+        else:
+            console.print("[red]Error: --try-multiple-credentials requires --multiple-usernames, --multiple-passwords, or --credentials-file[/red]")
+            sys.exit(1)
+    
+    else:
+        # Single credential mode (existing behavior)
+        if not username:
+            console.print("[red]Error: Must provide --username for single credential mode[/red]")
+            sys.exit(1)
+        
+        if not password and not key_file and not try_all_methods:
+            # Prompt user (legacy behaviour) if no stored credential available
+            password = click.prompt(
+                "Enter SSH password",
+                hide_input=True,
+                show_default=False,
+                default=""
+            )
+            if password:
+                console.print("[yellow]Password captured from prompt[/yellow]")
+            else:
+                console.print("[red]Error: Must provide --password, --key-file, or --try-all-methods[/red]")
+                sys.exit(1)
+    
+    # Display configuration
     console.print(f"[green]SSH port:[/green] {port}")
     console.print(f"[green]Timeout:[/green] {timeout}s")
     console.print(f"[green]Threads:[/green] {threads}")
     
-    if password:
-        suffix = " [dim](stored)[/dim]" if used_stored_password else ""
-        console.print(f"[yellow]Password:[/yellow] [redacted]{suffix}")
-    if key_file:
-        suffix = " [dim](stored)[/dim]" if used_stored_key else ""
-        console.print(f"[yellow]Key file:[/yellow] {key_file}{suffix}")
-    if try_all_methods:
-        console.print("[yellow]Will try all available authentication methods[/yellow]")
+    if try_multiple_credentials:
+        console.print(f"[green]Credentials:[/green] {len(credentials_list)} credential pairs")
+    else:
+        username_suffix = " [dim](stored)[/dim]" if used_stored_username else ""
+        console.print(f"[green]Username:[/green] {username}{username_suffix}")
+        if password:
+            password_suffix = " [dim](stored)[/dim]" if used_stored_password else ""
+            console.print(f"[yellow]Password:[/yellow] [redacted]{password_suffix}")
+        if key_file:
+            key_suffix = " [dim](stored)[/dim]" if used_stored_key else ""
+            console.print(f"[yellow]Key file:[/yellow] {key_file}{key_suffix}")
+        if try_all_methods:
+            console.print("[yellow]Will try all available authentication methods[/yellow]")
     
     try:
         # Initialize SSH connector
@@ -296,7 +440,13 @@ def auth(ctx, hosts, from_db, username, password, key_file, port, timeout, threa
         
         results = []
         
-        if try_all_methods:
+        if try_multiple_credentials:
+            # Test multiple credentials
+            console.print(f"\n[cyan]Testing multiple credentials on {len(host_list)} hosts...[/cyan]")
+            results = ssh_connector.concurrent_test_multiple_credentials(
+                host_list, port, credentials_list, threads
+            )
+        elif try_all_methods:
             # Try all authentication methods for each host
             console.print(f"\n[cyan]Testing all authentication methods on {len(host_list)} hosts...[/cyan]")
             
@@ -320,11 +470,23 @@ def auth(ctx, hosts, from_db, username, password, key_file, port, timeout, threa
         for result in results:
             if result['connected']:
                 successful_hosts.append(result)
-                auth_method = result.get('auth_method', 'unknown')
-                console.print(f"[green]✓ {result['host']}:{result['port']} - {auth_method}[/green]")
+                if try_multiple_credentials:
+                    # Display multiple credentials results
+                    cred_info = result.get('successful_credential', {})
+                    username_used = cred_info.get('username', 'unknown')
+                    method_used = cred_info.get('method', 'unknown')
+                    console.print(f"[green]✓ {result['host']}:{result['port']} - {username_used} ({method_used})[/green]")
+                else:
+                    # Display single credential results
+                    auth_method = result.get('auth_method', 'unknown')
+                    console.print(f"[green]✓ {result['host']}:{result['port']} - {auth_method}[/green]")
             else:
                 failed_hosts.append(result)
-                console.print(f"[red]✗ {result['host']}:{result['port']} - {result['error']}[/red]")
+                if try_multiple_credentials:
+                    attempt_count = len(result.get('attempts', []))
+                    console.print(f"[red]✗ {result['host']}:{result['port']} - {result['error']} ({attempt_count} attempts)[/red]")
+                else:
+                    console.print(f"[red]✗ {result['host']}:{result['port']} - {result['error']}[/red]")
         
         # Summary
         summary = ssh_connector.get_connection_summary(results)
@@ -353,16 +515,20 @@ def auth(ctx, hosts, from_db, username, password, key_file, port, timeout, threa
 @scan.command()
 @click.option('--hosts', '-h', help='Comma-separated list of IP addresses/hostnames')
 @click.option('--from-db', is_flag=True, help='Use hosts from database')
-@click.option('--username', '-u', required=True, help='SSH username')
-@click.option('--password', '-p', help='SSH password', prompt=True, hide_input=True, prompt_required=False)
+@click.option('--username', '-u', help='SSH username (falls back to stored credential)')
+@click.option('--password', '-p', help='SSH password (falls back to stored credential)')
 @click.option('--key-file', '-k', help='SSH private key file path')
+@click.option('--multiple-usernames', help='Comma-separated list of usernames to try')
+@click.option('--multiple-passwords', help='Comma-separated list of passwords to try')
+@click.option('--credentials-file', help='File containing username:password pairs (one per line)')
+@click.option('--try-multiple-credentials', is_flag=True, help='Try multiple username/password combinations')
 @click.option('--port', '-P', default=22, help='SSH port (default: 22)')
-@click.option('--timeout', '-T', default=15, help='Connection timeout in seconds (default: 15)')
+@click.option('--timeout', '-T', default=8, help='Connection timeout in seconds (default: 8)')
 @click.option('--store-db', is_flag=True, help='Store collected information in database')
 @click.option('--output', '-o', help='Output file for detailed results')
 @click.option('--format', '-f', type=click.Choice(['text', 'json']), default='text', help='Output format')
 @click.pass_context
-def info(ctx, hosts, from_db, username, password, key_file, port, timeout, store_db, output, format):
+def info(ctx, hosts, from_db, username, password, key_file, multiple_usernames, multiple_passwords, credentials_file, try_multiple_credentials, port, timeout, store_db, output, format):
     """Collect system information from SSH-accessible hosts"""
     
     console.print(Panel.fit(
@@ -371,16 +537,17 @@ def info(ctx, hosts, from_db, username, password, key_file, port, timeout, store
     ))
     
     # Validate inputs
-    if not validate_username(username):
-        console.print(f"[red]Error: Invalid username format: {username}[/red]")
-        sys.exit(1)
-    
     if not validate_port(port):
         console.print(f"[red]Error: Invalid port number: {port}[/red]")
         sys.exit(1)
     
     if not validate_timeout(timeout):
         console.print(f"[red]Error: Invalid timeout: {timeout}[/red]")
+        sys.exit(1)
+    
+    # Validate username for single credential mode
+    if username and not validate_username(username):
+        console.print(f"[red]Error: Invalid username format: {username}[/red]")
         sys.exit(1)
     
     # Get host list
@@ -410,8 +577,15 @@ def info(ctx, hosts, from_db, username, password, key_file, port, timeout, store
         return
     
     from .config import config_manager
+    used_stored_username = False
     used_stored_password = False
     used_stored_key = False
+
+    if not username:
+        stored_username = config_manager.get_credential_value('username')
+        if stored_username:
+            username = stored_username
+            used_stored_username = True
 
     if not password:
         stored_password = config_manager.get_credential_value('password')
@@ -424,23 +598,109 @@ def info(ctx, hosts, from_db, username, password, key_file, port, timeout, store
         if stored_key:
             key_file = stored_key
             used_stored_key = True
+
+    credentials_list = []
     
-    # Check authentication parameters
-    if not password and not key_file:
-        console.print("[red]Error: Must provide either --password or --key-file[/red]")
-        sys.exit(1)
+    if try_multiple_credentials:
+        # Parse multiple credentials (same logic as auth command)
+        if credentials_file:
+            console.print(f"[blue]Loading credentials from file: {credentials_file}[/blue]")
+            try:
+                with open(credentials_file, 'r') as f:
+                    for line_num, line in enumerate(f, 1):
+                        line = line.strip()
+                        if line and not line.startswith('#'):
+                            if ':' in line:
+                                cred_username, cred_password = line.split(':', 1)
+                                credentials_list.append({
+                                    'username': cred_username.strip(),
+                                    'password': cred_password.strip()
+                                })
+                            else:
+                                console.print(f"[yellow]Warning: Invalid credential format on line {line_num}: {line}[/yellow]")
+                console.print(f"[green]Loaded {len(credentials_list)} credentials from file[/green]")
+            except FileNotFoundError:
+                console.print(f"[red]Error: Credentials file not found: {credentials_file}[/red]")
+                sys.exit(1)
+            except Exception as e:
+                console.print(f"[red]Error reading credentials file: {e}[/red]")
+                sys.exit(1)
+        
+        elif multiple_usernames and multiple_passwords:
+            # Parse multiple usernames and passwords
+            usernames = [u.strip() for u in multiple_usernames.split(',')]
+            passwords = [p.strip() for p in multiple_passwords.split(',')]
+            
+            if len(usernames) != len(passwords):
+                console.print("[red]Error: Number of usernames must match number of passwords[/red]")
+                sys.exit(1)
+            
+            for u, p in zip(usernames, passwords):
+                if not validate_username(u):
+                    console.print(f"[red]Error: Invalid username format: {u}[/red]")
+                    sys.exit(1)
+                credentials_list.append({'username': u, 'password': p})
+            
+            console.print(f"[green]Using {len(credentials_list)} username/password pairs[/green]")
+        
+        elif multiple_usernames:
+            # Multiple usernames with single password or key
+            usernames = [u.strip() for u in multiple_usernames.split(',')]
+            
+            for u in usernames:
+                if not validate_username(u):
+                    console.print(f"[red]Error: Invalid username format: {u}[/red]")
+                    sys.exit(1)
+                
+                cred = {'username': u}
+                if password:
+                    cred['password'] = password
+                if key_file:
+                    cred['key_file'] = key_file
+                credentials_list.append(cred)
+            
+            console.print(f"[green]Using {len(credentials_list)} usernames[/green]")
+        
+        else:
+            console.print("[red]Error: --try-multiple-credentials requires --multiple-usernames, --multiple-passwords, or --credentials-file[/red]")
+            sys.exit(1)
     
-    console.print(f"[green]Username:[/green] {username}")
+    else:
+        # Single credential mode (existing behavior)
+        if not username:
+            console.print("[red]Error: Must provide --username for single credential mode[/red]")
+            sys.exit(1)
+        
+        if not password and not key_file:
+            password = click.prompt(
+                "Enter SSH password",
+                hide_input=True,
+                show_default=False,
+                default=""
+            )
+            if password:
+                console.print("[yellow]Password captured from prompt[/yellow]")
+            else:
+                console.print("[red]Error: Must provide either --password or --key-file[/red]")
+                sys.exit(1)
+    
+    # Display configuration
     console.print(f"[green]SSH port:[/green] {port}")
     console.print(f"[green]Timeout:[/green] {timeout}s")
     console.print(f"[green]Output format:[/green] {format}")
     
-    if password:
-        suffix = " [dim](stored)[/dim]" if used_stored_password else ""
-        console.print(f"[yellow]Password:[/yellow] [redacted]{suffix}")
-    if key_file:
-        suffix = " [dim](stored)[/dim]" if used_stored_key else ""
-        console.print(f"[yellow]Key file:[/yellow] {key_file}{suffix}")
+    if try_multiple_credentials:
+        console.print(f"[green]Credentials:[/green] {len(credentials_list)} credential pairs")
+    else:
+        username_suffix = " [dim](stored)[/dim]" if used_stored_username else ""
+        console.print(f"[green]Username:[/green] {username}{username_suffix}")
+        if password:
+            password_suffix = " [dim](stored)[/dim]" if used_stored_password else ""
+            console.print(f"[yellow]Password:[/yellow] [redacted]{password_suffix}")
+        if key_file:
+            key_suffix = " [dim](stored)[/dim]" if used_stored_key else ""
+            console.print(f"[yellow]Key file:[/yellow] {key_file}{key_suffix}")
+
     if store_db:
         console.print("[yellow]Will store results in database[/yellow]")
     
@@ -450,10 +710,16 @@ def info(ctx, hosts, from_db, username, password, key_file, port, timeout, store
         info_collector = SystemInfoCollector(ssh_connector)
         
         # Collect system information
-        console.print(f"\n[cyan]Collecting system information from {len(host_list)} hosts...[/cyan]")
-        results = info_collector.collect_from_multiple_hosts(
-            host_list, port, username, password, key_file
-        )
+        if try_multiple_credentials:
+            console.print(f"\n[cyan]Collecting system information from {len(host_list)} hosts using multiple credentials...[/cyan]")
+            results = info_collector.collect_from_multiple_hosts_with_credentials(
+                host_list, port, credentials_list
+            )
+        else:
+            console.print(f"\n[cyan]Collecting system information from {len(host_list)} hosts...[/cyan]")
+            results = info_collector.collect_from_multiple_hosts(
+                host_list, port, username, password, key_file
+            )
         
         # Display results
         console.print(f"\n[bold blue]System Information Collection Results:[/bold blue]")
@@ -465,15 +731,29 @@ def info(ctx, hosts, from_db, username, password, key_file, port, timeout, store
         for result in results:
             if result['collection_success']:
                 successful_collections.append(result)
-                console.print(f"[green]✓ {result['host']} - Complete system info collected[/green]")
-            elif result['raw_outputs']:
+                if try_multiple_credentials:
+                    cred_info = result.get('successful_credential', {})
+                    username_used = cred_info.get('username', 'unknown')
+                    console.print(f"[green]✓ {result['host']} - Complete system info collected using {username_used}[/green]")
+                else:
+                    console.print(f"[green]✓ {result['host']} - Complete system info collected[/green]")
+            elif result.get('raw_outputs'):
                 partial_collections.append(result)
                 error_count = len(result['collection_errors'])
-                console.print(f"[yellow]⚠ {result['host']} - Partial system info collected ({error_count} issues)[/yellow]")
+                if try_multiple_credentials:
+                    cred_info = result.get('successful_credential', {})
+                    username_used = cred_info.get('username', 'unknown')
+                    console.print(f"[yellow]⚠ {result['host']} - Partial system info collected using {username_used} ({error_count} issues)[/yellow]")
+                else:
+                    console.print(f"[yellow]⚠ {result['host']} - Partial system info collected ({error_count} issues)[/yellow]")
             else:
                 failed_collections.append(result)
                 error_count = len(result['collection_errors'])
-                console.print(f"[red]✗ {result['host']} - {error_count} collection errors[/red]")
+                if try_multiple_credentials:
+                    attempt_count = result.get('auth_attempts', 0)
+                    console.print(f"[red]✗ {result['host']} - {error_count} collection errors ({attempt_count} auth attempts)[/red]")
+                else:
+                    console.print(f"[red]✗ {result['host']} - {error_count} collection errors[/red]")
         
         # Summary
         console.print(f"\n[bold blue]Collection Summary:[/bold blue]")
@@ -486,7 +766,7 @@ def info(ctx, hosts, from_db, username, password, key_file, port, timeout, store
         if partial_collections:
             console.print(f"[cyan]Hosts with usable partial data:[/cyan] {coverage_rate:.1f}%")
         
-        collections_to_store = [res for res in results if res['collection_success'] or res['raw_outputs']]
+        collections_to_store = [res for res in results if res['collection_success'] or res.get('raw_outputs')]
         
         # Store in database if requested
         if store_db and collections_to_store:
@@ -522,6 +802,13 @@ def info(ctx, hosts, from_db, username, password, key_file, port, timeout, store
                     if 'disk' in parsed:
                         import json
                         host_data['disk_usage'] = json.dumps(parsed['disk'])
+
+                    cred_info = result.get('successful_credential', {})
+                    if cred_info:
+                        host_data['working_username'] = cred_info.get('username')
+                        host_data['auth_method'] = cred_info.get('method')
+                    if result.get('auth_attempts') is not None:
+                        host_data['auth_attempts'] = result.get('auth_attempts')
                     
                     # Create or update host in database
                     from .database.operations import db_manager
@@ -566,6 +853,203 @@ def info(ctx, hosts, from_db, username, password, key_file, port, timeout, store
         sys.exit(1)
     except Exception as e:
         console.print(f"[red]Error during information collection: {e}[/red]")
+        if ctx.obj.get('debug'):
+            import traceback
+            traceback.print_exc()
+        sys.exit(1)
+
+@scan.command()
+@click.option('--range', '-r', required=True, help='IP range to scan (e.g., 192.168.1.0/24) or comma-separated IPs')
+@click.option('--username', '-u', help='SSH username')
+@click.option('--password', '-p', help='SSH password')
+@click.option('--key-file', '-k', help='SSH private key file path')
+@click.option('--multiple-usernames', help='Comma-separated list of usernames to try')
+@click.option('--multiple-passwords', help='Comma-separated list of passwords to try')
+@click.option('--credentials-file', help='File containing username:password pairs (one per line)')
+@click.option('--port', '-P', default=22, help='SSH port (default: 22)')
+@click.option('--timeout', '-T', default=5, help='Connection timeout in seconds (default: 5)')
+@click.option('--threads', '-t', default=10, help='Number of concurrent threads (default: 10)')
+@click.option('--no-nmap', is_flag=True, help='Skip nmap scan and use socket scan only')
+@click.option('--store-db', is_flag=True, default=True, help='Store results in database (default: True)')
+@click.option('--output', '-o', help='Output file for detailed results')
+@click.option('--format', '-f', type=click.Choice(['text', 'json']), default='json', help='Output format (default: json)')
+@click.pass_context
+def full(ctx, range, username, password, key_file, multiple_usernames, multiple_passwords, credentials_file, port, timeout, threads, no_nmap, store_db, output, format):
+    """Complete network analysis: Discovery → Authentication → Information Collection → Database Storage"""
+    
+    console.print(Panel.fit(
+        Text("NetScan - Comprehensive Network Analysis", style="bold cyan"),
+        border_style="cyan"
+    ))
+    
+    # Validate inputs
+    if not validate_port(port):
+        console.print(f"[red]Error: Invalid port number: {port}[/red]")
+        sys.exit(1)
+    
+    if not validate_timeout(timeout):
+        console.print(f"[red]Error: Invalid timeout: {timeout}[/red]")
+        sys.exit(1)
+    
+    if not validate_threads(threads):
+        console.print(f"[red]Error: Invalid thread count: {threads}[/red]")
+        sys.exit(1)
+    
+    # Parse and validate credentials (reusing logic from auth command)
+    credentials_list = []
+    
+    if credentials_file:
+        console.print(f"[blue]Loading credentials from file: {credentials_file}[/blue]")
+        try:
+            with open(credentials_file, 'r') as f:
+                for line_num, line in enumerate(f, 1):
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        if ':' in line:
+                            cred_username, cred_password = line.split(':', 1)
+                            credentials_list.append({
+                                'username': cred_username.strip(),
+                                'password': cred_password.strip()
+                            })
+                        else:
+                            console.print(f"[yellow]Warning: Invalid credential format on line {line_num}: {line}[/yellow]")
+            console.print(f"[green]Loaded {len(credentials_list)} credentials from file[/green]")
+        except FileNotFoundError:
+            console.print(f"[red]Error: Credentials file not found: {credentials_file}[/red]")
+            sys.exit(1)
+        except Exception as e:
+            console.print(f"[red]Error reading credentials file: {e}[/red]")
+            sys.exit(1)
+    
+    elif multiple_usernames and multiple_passwords:
+        # Parse multiple usernames and passwords
+        usernames = [u.strip() for u in multiple_usernames.split(',')]
+        passwords = [p.strip() for p in multiple_passwords.split(',')]
+        
+        if len(usernames) != len(passwords):
+            console.print("[red]Error: Number of usernames must match number of passwords[/red]")
+            sys.exit(1)
+        
+        for u, p in zip(usernames, passwords):
+            if not validate_username(u):
+                console.print(f"[red]Error: Invalid username format: {u}[/red]")
+                sys.exit(1)
+            credentials_list.append({'username': u, 'password': p})
+        
+        console.print(f"[green]Using {len(credentials_list)} username/password pairs[/green]")
+    
+    elif multiple_usernames:
+        # Multiple usernames with single password or key
+        usernames = [u.strip() for u in multiple_usernames.split(',')]
+        
+        for u in usernames:
+            if not validate_username(u):
+                console.print(f"[red]Error: Invalid username format: {u}[/red]")
+                sys.exit(1)
+            
+            cred = {'username': u}
+            if password:
+                cred['password'] = password
+            if key_file:
+                cred['key_file'] = key_file
+            credentials_list.append(cred)
+        
+        console.print(f"[green]Using {len(credentials_list)} usernames[/green]")
+    
+    elif username:
+        # Single credential
+        if not validate_username(username):
+            console.print(f"[red]Error: Invalid username format: {username}[/red]")
+            sys.exit(1)
+        
+        cred = {'username': username}
+        if password:
+            cred['password'] = password
+        if key_file:
+            cred['key_file'] = key_file
+        credentials_list.append(cred)
+        
+        console.print(f"[green]Using single credential: {username}[/green]")
+    
+    else:
+        console.print("[red]Error: Must provide credentials via --username, --multiple-usernames, or --credentials-file[/red]")
+        sys.exit(1)
+    
+    # Display configuration
+    console.print(f"[green]IP Range:[/green] {range}")
+    console.print(f"[green]SSH Port:[/green] {port}")
+    console.print(f"[green]Timeout:[/green] {timeout}s")
+    console.print(f"[green]Threads:[/green] {threads}")
+    console.print(f"[green]Credentials:[/green] {len(credentials_list)} credential pairs")
+    console.print(f"[green]Use nmap:[/green] {not no_nmap}")
+    console.print(f"[green]Store in DB:[/green] {store_db}")
+    
+    try:
+        # Initialize comprehensive scanner
+        comprehensive_scanner = ComprehensiveScanner(timeout=timeout, threads=threads)
+        
+        # Perform comprehensive scan
+        results = comprehensive_scanner.comprehensive_scan(
+            ip_range=range,
+            port=port,
+            credentials=credentials_list,
+            store_db=store_db,
+            use_nmap=not no_nmap
+        )
+        
+        # Output detailed results if requested
+        if output:
+            console.print(f"\n[blue]Writing detailed results to {output}...[/blue]")
+            try:
+                with open(output, 'w') as f:
+                    if format == 'json':
+                        import json
+                        json.dump(results, f, indent=2, default=str)
+                    else:
+                        # Text format summary
+                        f.write("NetScan Comprehensive Scan Results\n")
+                        f.write("=" * 50 + "\n\n")
+                        
+                        # Network Discovery
+                        net = results['network_discovery']
+                        f.write(f"Network Discovery:\n")
+                        f.write(f"  SSH hosts found: {net['ssh_hosts_found']}\n\n")
+                        
+                        # Authentication
+                        auth = results['authentication']
+                        f.write(f"Authentication:\n")
+                        f.write(f"  Hosts tested: {auth['hosts_tested']}\n")
+                        f.write(f"  Successful auths: {auth['successful_auths']}\n")
+                        f.write(f"  Failed auths: {auth['failed_auths']}\n\n")
+                        
+                        # System Info
+                        info = results['system_info']
+                        f.write(f"System Information:\n")
+                        f.write(f"  Hosts processed: {info['hosts_collected']}\n")
+                        f.write(f"  Successful collections: {info['successful_collections']}\n")
+                        f.write(f"  Failed collections: {info['failed_collections']}\n\n")
+                        
+                        # Database
+                        db = results['database_storage']
+                        f.write(f"Database Storage:\n")
+                        f.write(f"  Hosts stored: {db['hosts_stored']}\n")
+                        f.write(f"  Storage errors: {len(db['storage_errors'])}\n\n")
+                        
+                        # Timing
+                        duration = results['scan_end_time'] - results['scan_start_time']
+                        f.write(f"Scan Duration: {duration:.1f} seconds\n")
+                
+                console.print(f"[green]✓ Results written to {output}[/green]")
+            except Exception as e:
+                console.print(f"[red]Error writing to file: {e}[/red]")
+        
+        console.print(f"\n[bold green]Comprehensive scan completed successfully![/bold green]")
+        
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Comprehensive scan interrupted by user[/yellow]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error during comprehensive scan: {e}[/red]")
         if ctx.obj.get('debug'):
             import traceback
             traceback.print_exc()
@@ -942,9 +1426,10 @@ def config(ctx):
 @click.option('--set-timeout', type=int, help='Set default timeout')
 @click.option('--set-auth-timeout', type=int, help='Set SSH authentication timeout')
 @click.option('--set-preferred-auth', type=click.Choice(['key', 'password', 'agent']), help='Set preferred authentication method')
+@click.option('--set-additional-ports', help='Set additional ports to scan (comma-separated list)')
 @click.option('--set-log-level', type=click.Choice(['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']), help='Set logging level')
 @click.pass_context
-def set(ctx, key, value, set_username, set_password, set_port, set_threads, set_timeout, set_auth_timeout, set_preferred_auth, set_log_level):
+def set(ctx, key, value, set_username, set_password, set_port, set_threads, set_timeout, set_auth_timeout, set_preferred_auth, set_additional_ports, set_log_level):
     """Set configuration values"""
     
     console.print(Panel.fit(
@@ -964,7 +1449,9 @@ def set(ctx, key, value, set_username, set_password, set_port, set_threads, set_
                 'scanning.threads': 'scanning.default_threads',
                 'scanning.timeout': 'scanning.default_timeout',
                 'scanning.port': 'scanning.default_port',
-                'scanning.retries': 'scanning.max_retries'
+                'scanning.retries': 'scanning.max_retries',
+                'scanning.additional': 'scanning.additional_ports',
+                'scanning.extra_ports': 'scanning.additional_ports'
             }
             return aliases.get(config_key.lower(), config_key)
 
@@ -1066,6 +1553,14 @@ def set(ctx, key, value, set_username, set_password, set_port, set_threads, set_
         if set_preferred_auth:
             config_manager.set('ssh', 'preferred_auth', set_preferred_auth)
             console.print(f"[green]✓ Preferred authentication method set:[/green] {set_preferred_auth}")
+            changes_made = True
+
+        if set_additional_ports is not None:
+            ports = config_manager.set_additional_ports(set_additional_ports)
+            if ports:
+                console.print(f"[green]✓ Additional ports set:[/green] {', '.join(str(p) for p in ports)}")
+            else:
+                console.print("[yellow]Additional ports cleared[/yellow]")
             changes_made = True
         
         if set_log_level:
